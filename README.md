@@ -90,6 +90,13 @@ Managing multiple LLM providers is painful:
 - Real-time cost and usage monitoring
 - Zero-downtime configuration updates
 
+## 来自人类的补充
+
+	AI 总结得不错，我来补充一点---单纯就是被claude-mem的超高token消耗气糊涂了。气急败坏之下解耦了claude-mem的调用，
+	捞出来看看究竟消耗多少。本着来都来了的想法，干脆把切换的功能也在这个项目搞了吧。
+	
+	现在这个版本，应该就是最终版了，如果还有什么需求，交给AI都能搞定。（Lua方便测试和快速迭代，大概是AI友好的）
+
 ## License
 
 MIT
