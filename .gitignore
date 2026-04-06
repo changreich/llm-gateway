@@ -1,0 +1,33 @@
+# 编译目录
+target/
+
+# 编译产物
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 配置文件 (包含敏感信息)
+lua/config.lua
+lua/config.lua.*
+
+# 测试文件 (包含 API keys)
+test_*.py
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db

@@ -1,0 +1,90 @@
+-- LLM Gateway 配置文件示例
+--
+-- 复制此文件为 config.lua 并填入你的 API keys
+--
+-- Redis Key 设计:
+--   Provider: provider:<name> -> {baseurl, apikey}
+--   LLM: llm:<num> -> {provider, model, cd}
+--   Embed: embed:provider, embed:model
+--   Rank: rank:provider, rank:model
+--   Config: llm:select, llm:config:switch_threshold, llm:config:cool_down
+
+return {
+    -- Redis 连接
+    redis_host = "127.0.0.1",
+    redis_port = 6379,
+    redis_db = 0,
+
+    -- 网关配置
+    switch_threshold = 2,
+    cool_down = 3,  -- 冷却时间（秒），用于负载均衡
+
+    -- 当前选中的 LLM（主用模型，其他模型作为备用/负载均衡）
+    selected = "01",
+
+    -- 提供商配置
+    providers = {
+        siliconflow = {
+            baseurl = "https://api.siliconflow.cn/v1",
+            apikey = "YOUR_SILICONFLOW_API_KEY"
+        },
+        zhipu = {
+            baseurl = "https://open.bigmodel.cn/api/paas/v4",
+            apikey = "YOUR_ZHIPU_API_KEY"
+        },
+        openai = {
+            baseurl = "https://api.openai.com/v1",
+            apikey = "YOUR_OPENAI_API_KEY"
+        },
+        anthropic = {
+            baseurl = "https://api.anthropic.com",
+            apikey = "YOUR_ANTHROPIC_API_KEY"
+        },
+        -- 本地模型服务
+        local_embed = {
+            baseurl = "http://127.0.0.1:3333",
+            apikey = ""
+        },
+        local_rerank = {
+            baseurl = "http://127.0.0.1:3335",
+            apikey = ""
+        }
+    },
+
+    -- LLM 配置 (支持多个模型，自动负载均衡)
+    -- cd: 冷却时间（秒），防止同一模型被连续选中
+    llm = {
+        ["01"] = {
+            provider = "zhipu",
+            model = "GLM-4-Flash",
+            cd = 3
+        },
+        ["02"] = {
+            provider = "siliconflow",
+            model = "Qwen/Qwen3-4B",
+            cd = 3
+        },
+        ["03"] = {
+            provider = "siliconflow",
+            model = "deepseek-ai/DeepSeek-V3",
+            cd = 3
+        },
+        ["04"] = {
+            provider = "openai",
+            model = "gpt-4o-mini",
+            cd = 3
+        }
+    },
+
+    -- Embeddings 配置
+    embed = {
+        provider = "local_embed",
+        model = "bge-large-zh-v1.5"
+    },
+
+    -- Rerank 配置
+    rank = {
+        provider = "local_rerank",
+        model = "bge-reranker-base"
+    }
+}
