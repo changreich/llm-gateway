@@ -16,16 +16,12 @@ use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_proxy::{ProxyHttp, Session};
-use r2d2::{Pool, PooledConnection};
-use r2d2_redis::RedisConnectionManager;
+use redis::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-
-type RedisPool = Pool<RedisConnectionManager>;
-type RedisConn = PooledConnection<RedisConnectionManager>;
 
 /// 模型统计数据
 #[derive(Clone, Debug, Default)]
@@ -45,15 +41,76 @@ static STATS_MODELS: Lazy<RwLock<HashMap<String, ModelStats>>> = Lazy::new(|| Rw
 static STATS_SELECTED: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("01".to_string()));
 static STATS_CONFIG: Lazy<RwLock<HashMap<String, (String, String)>>> = Lazy::new(|| RwLock::new(HashMap::new())); // num -> (provider, model);
 
-/// 全局 Redis 连接 URL
-static REDIS_POOL: Lazy<RedisPool> = Lazy::new(|| {
+/// 简单的 Redis 连接池
+struct RedisConnPool {
+    client: Client,
+    pool: Mutex<Vec<redis::Connection>>,
+    max_size: usize,
+}
+
+impl RedisConnPool {
+    fn new(url: &str, max_size: usize) -> Self {
+        let client = Client::open(url).expect("Redis client");
+        Self {
+            client,
+            pool: Mutex::new(Vec::with_capacity(max_size)),
+            max_size,
+        }
+    }
+
+    fn get(&self) -> Option<RedisConnGuard> {
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(conn) = pool.pop() {
+            Some(RedisConnGuard { conn: Some(conn), pool: &self.pool })
+        } else {
+            self.client.get_connection().ok().map(|conn| {
+                RedisConnGuard { conn: Some(conn), pool: &self.pool }
+            })
+        }
+    }
+}
+
+/// 连接守卫，归还连接到池
+struct RedisConnGuard<'a> {
+    conn: Option<redis::Connection>,
+    pool: &'a Mutex<Vec<redis::Connection>>,
+}
+
+impl std::ops::Deref for RedisConnGuard<'_> {
+    type Target = redis::Connection;
+    fn deref(&self) -> &Self::Target {
+        self.conn.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for RedisConnGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.conn.as_mut().unwrap()
+    }
+}
+
+impl Drop for RedisConnGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let mut pool = self.pool.lock().unwrap();
+            if pool.len() < 10 {  // max_size
+                pool.push(conn);
+            }
+            // 如果池满了，连接直接 drop
+        }
+    }
+}
+
+/// 全局 Redis 连接池
+static REDIS_POOL: Lazy<RedisConnPool> = Lazy::new(|| {
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:7379".to_string());
-    let manager = RedisConnectionManager::new(url).expect("Redis connection manager");
-    Pool::builder()
-        .max_size(3)
-        .build(manager)
-        .expect("Redis connection pool")
+    RedisConnPool::new(&url, 10)
 });
+
+/// 获取 Redis 连接
+fn get_redis_conn() -> Option<RedisConnGuard<'static>> {
+    REDIS_POOL.get()
+}
 
 /// TLS 证书验证开关 (默认跳过，因为有透明代理)
 static SKIP_TLS_VERIFY: Lazy<bool> = Lazy::new(|| {
@@ -97,14 +154,15 @@ impl LuaRuntime {
 
         // redis_get(key) -> value | nil
         let redis_get_fn = lua.create_function(|lua, key: String| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => return Ok(None),
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(None),
             };
-            let value: Option<String> = redis::cmd("GET")
+            let value = redis::cmd("GET")
                 .arg(&key)
-                .query(&mut *conn)
-                .ok();
+                .query::<Option<String>>(&mut conn)
+                .ok()
+                .flatten();
 
             match value {
                 Some(v) => Ok(Some(lua.create_string(&v)?)),
@@ -115,14 +173,14 @@ impl LuaRuntime {
 
         // redis_set(key, value) -> bool
         let redis_set_fn = lua.create_function(|_lua, (key, value): (String, String)| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => return Ok(false),
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(false),
             };
             let result: bool = redis::cmd("SET")
                 .arg(&key)
                 .arg(&value)
-                .query(&mut *conn)
+                .query::<()>(&mut conn)
                 .is_ok();
             Ok(result)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_set: {}", e)))?;
@@ -130,16 +188,16 @@ impl LuaRuntime {
 
         // redis_keys(pattern) -> table
         let redis_keys_fn = lua.create_function(|lua, pattern: String| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => {
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => {
                     let table = lua.create_table()?;
                     return Ok(table);
                 }
             };
             let keys: Vec<String> = redis::cmd("KEYS")
                 .arg(&pattern)
-                .query(&mut *conn)
+                .query::<Vec<String>>(&mut conn)
                 .unwrap_or_default();
 
             let table = lua.create_table()?;
@@ -152,13 +210,13 @@ impl LuaRuntime {
 
         // redis_incr(key) -> number
         let redis_incr_fn = lua.create_function(|_lua, key: String| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => return Ok(0i64),
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(0i64),
             };
             let n: i64 = redis::cmd("INCR")
                 .arg(&key)
-                .query(&mut *conn)
+                .query::<i64>(&mut conn)
                 .unwrap_or(0);
             Ok(n)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_incr: {}", e)))?;
@@ -166,14 +224,14 @@ impl LuaRuntime {
 
         // redis_incrby(key, amount) -> number
         let redis_incrby_fn = lua.create_function(|_lua, (key, amount): (String, i64)| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => return Ok(0i64),
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(0i64),
             };
             let n: i64 = redis::cmd("INCRBY")
                 .arg(&key)
                 .arg(amount)
-                .query(&mut *conn)
+                .query::<i64>(&mut conn)
                 .unwrap_or(0);
             Ok(n)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_incrby: {}", e)))?;
@@ -189,14 +247,14 @@ impl LuaRuntime {
 
         // redis_expire(key, seconds) -> bool
         let redis_expire_fn = lua.create_function(|_lua, (key, seconds): (String, i64)| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => return Ok(false),
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(false),
             };
             let result: i64 = redis::cmd("EXPIRE")
                 .arg(&key)
                 .arg(seconds)
-                .query(&mut *conn)
+                .query::<i64>(&mut conn)
                 .unwrap_or(0);
             Ok(result == 1)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_expire: {}", e)))?;
@@ -204,14 +262,14 @@ impl LuaRuntime {
 
         // redis_lpush(key, value) -> bool
         let redis_lpush_fn = lua.create_function(|_lua, (key, value): (String, String)| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => return Ok(false),
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(false),
             };
             let result: i64 = redis::cmd("LPUSH")
                 .arg(&key)
                 .arg(&value)
-                .query(&mut *conn)
+                .query::<i64>(&mut conn)
                 .unwrap_or(0);
             Ok(result > 0)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_lpush: {}", e)))?;
@@ -219,15 +277,15 @@ impl LuaRuntime {
 
         // redis_ltrim(key, start, stop) -> bool
         let redis_ltrim_fn = lua.create_function(|_lua, (key, start, stop): (String, i64, i64)| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => return Ok(false),
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(false),
             };
             let result: bool = redis::cmd("LTRIM")
                 .arg(&key)
                 .arg(start)
                 .arg(stop)
-                .query(&mut *conn)
+                .query::<()>(&mut conn)
                 .is_ok();
             Ok(result)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_ltrim: {}", e)))?;
@@ -235,9 +293,9 @@ impl LuaRuntime {
 
         // redis_lrange(key, start, stop) -> table
         let redis_lrange_fn = lua.create_function(|lua, (key, start, stop): (String, i64, i64)| {
-            let mut conn = match REDIS_POOL.get() {
-                Ok(c) => c,
-                Err(_) => {
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => {
                     let table = lua.create_table()?;
                     return Ok(table);
                 }
@@ -246,7 +304,7 @@ impl LuaRuntime {
                 .arg(&key)
                 .arg(start)
                 .arg(stop)
-                .query(&mut *conn)
+                .query::<Vec<String>>(&mut conn)
                 .unwrap_or_default();
 
             let table = lua.create_table()?;
@@ -829,15 +887,15 @@ fn preload_config(config_path: &PathBuf) {
         }
     };
 
-    let mut conn = match REDIS_POOL.get() {
-        Ok(c) => c,
-        Err(e) => {
-            info!("Failed to get Redis connection: {}, skipping preload", e);
+    let mut conn = match get_redis_conn() {
+        Some(c) => c,
+        None => {
+            info!("Failed to get Redis connection, skipping preload");
             return;
         }
     };
 
-    if let Ok(existing) = redis::cmd("GET").arg("llm:initialized").query::<Option<String>>(&mut *conn) {
+    if let Ok(existing) = redis::cmd("GET").arg("llm:initialized").query::<Option<String>>(&mut conn) {
         if existing.is_some() {
             info!("Redis already initialized (llm:initialized exists), skipping preload");
             return;
@@ -849,11 +907,11 @@ fn preload_config(config_path: &PathBuf) {
     let cool_down: i64 = config_table.get("cool_down").unwrap_or(60);
 
     if let Ok(selected) = config_table.get::<String>("selected") {
-        let _ = redis::cmd("SET").arg("llm:select").arg(&selected).query::<()>(&mut *conn);
+        let _ = redis::cmd("SET").arg("llm:select").arg(&selected).query::<()>(&mut conn);
         info!("Set llm:select = {}", selected);
     }
 
-    let _ = redis::cmd("SET").arg("llm:config:cool_down").arg(cool_down).query::<()>(&mut *conn);
+    let _ = redis::cmd("SET").arg("llm:config:cool_down").arg(cool_down).query::<()>(&mut conn);
     info!("Set llm:config:cool_down = {}", cool_down);
 
     if let Ok(providers) = config_table.get::<Table>("providers") {
@@ -863,7 +921,7 @@ fn preload_config(config_path: &PathBuf) {
                 let apikey: String = cfg.get("apikey").unwrap_or_default();
                 let key = format!("provider:{}", name);
                 let value = format!("{}|{}", baseurl, apikey);
-                let _ = redis::cmd("SET").arg(&key).arg(&value).query::<()>(&mut *conn);
+                let _ = redis::cmd("SET").arg(&key).arg(&value).query::<()>(&mut conn);
                 info!("Set provider:{} = {}|***", name, baseurl);
             }
         }
@@ -877,7 +935,7 @@ fn preload_config(config_path: &PathBuf) {
                 let cd: i64 = cfg.get("cd").unwrap_or(cool_down);
                 let key = format!("llm:{}", num);
                 let value = format!("{}|{}|{}", provider, model, cd);
-                let _ = redis::cmd("SET").arg(&key).arg(&value).query::<()>(&mut *conn);
+                let _ = redis::cmd("SET").arg(&key).arg(&value).query::<()>(&mut conn);
                 info!("Set llm:{} = {}|{}|{}", num, provider, model, cd);
             }
         }
@@ -885,27 +943,27 @@ fn preload_config(config_path: &PathBuf) {
 
     if let Ok(embed) = config_table.get::<Table>("embed") {
         if let Ok(provider) = embed.get::<String>("provider") {
-            let _ = redis::cmd("SET").arg("embed:provider").arg(&provider).query::<()>(&mut *conn);
+            let _ = redis::cmd("SET").arg("embed:provider").arg(&provider).query::<()>(&mut conn);
             info!("Set embed:provider = {}", provider);
         }
         if let Ok(model) = embed.get::<String>("model") {
-            let _ = redis::cmd("SET").arg("embed:model").arg(&model).query::<()>(&mut *conn);
+            let _ = redis::cmd("SET").arg("embed:model").arg(&model).query::<()>(&mut conn);
             info!("Set embed:model = {}", model);
         }
     }
 
     if let Ok(rank) = config_table.get::<Table>("rank") {
         if let Ok(provider) = rank.get::<String>("provider") {
-            let _ = redis::cmd("SET").arg("rank:provider").arg(&provider).query::<()>(&mut *conn);
+            let _ = redis::cmd("SET").arg("rank:provider").arg(&provider).query::<()>(&mut conn);
             info!("Set rank:provider = {}", provider);
         }
         if let Ok(model) = rank.get::<String>("model") {
-            let _ = redis::cmd("SET").arg("rank:model").arg(&model).query::<()>(&mut *conn);
+            let _ = redis::cmd("SET").arg("rank:model").arg(&model).query::<()>(&mut conn);
             info!("Set rank:model = {}", model);
         }
     }
 
-    let _ = redis::cmd("SET").arg("llm:initialized").arg("1").query::<()>(&mut *conn);
+    let _ = redis::cmd("SET").arg("llm:initialized").arg("1").query::<()>(&mut conn);
     info!("Config preload completed, llm:initialized = 1");
 }
 

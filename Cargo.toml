@@ -1,6 +1,6 @@
 [package]
 name = "llm-gateway"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -12,7 +12,7 @@ pingora-http = { path = "../pingora-main/pingora-http" }
 pingora-error = { path = "../pingora-main/pingora-error" }
 
 # Lua runtime
-mlua = { version = "0.10", features = ["lua54", "send", "vendored"] }
+mlua = { version = "0.11", features = ["lua54", "send", "vendored"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -20,8 +20,6 @@ async-trait = "0.1"
 
 # Redis
 redis = "0.27"
-r2d2 = "0.8"
-r2d2_redis = "0.16"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
