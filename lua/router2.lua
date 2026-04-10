@@ -9,8 +9,50 @@
 
 handler = {}
 
+-- 从 config2.lua 加载默认配置
+local config_file = loadfile("lua/config2.lua")
+local default_config = config_file and config_file() or {}
+
 -- 加载 SDK 模块
 local sdk = dofile(script_dir .. "/sdk/init.lua")
+
+-- 默认配置
+local default_code = default_config.code or {}
+local default_opt = default_config.opt or {}
+
+-------------------------------------------------------------------------------
+-- 初始化：将 config2.lua 配置写入 Redis
+-------------------------------------------------------------------------------
+
+local function init_config_to_redis()
+    local ok, initialized = pcall(redis_get, "code:initialized")
+    if ok and initialized == "1" then
+        return
+    end
+
+    -- 写入 code 配置
+    for num, cfg in pairs(default_code) do
+        local key = "code:" .. num
+        local value = (cfg.provider or "") .. "|" .. (cfg.model or "") .. "|" .. (cfg.opt or "")
+        pcall(redis_set, key, value)
+    end
+
+    -- 写入 opt 配置
+    for opt_id, fields in pairs(default_opt) do
+        for field, value in pairs(fields) do
+            local key = "opt:" .. opt_id .. ":" .. field
+            pcall(redis_set, key, value)
+        end
+    end
+
+    -- 设置默认选中
+    if default_config.selected then
+        pcall(redis_set, "code:select", default_config.selected)
+    end
+
+    -- 标记已初始化
+    pcall(redis_set, "code:initialized", "1")
+end
 
 -------------------------------------------------------------------------------
 -- 工具函数
@@ -174,6 +216,9 @@ end
 -------------------------------------------------------------------------------
 
 function handler.on_request(method, path, headers, body)
+    -- 初始化配置到 Redis
+    init_config_to_redis()
+
     -- URL 匹配：路径中包含 "code" 字样
     if not string.find(path, "code") then
         return {
