@@ -20,6 +20,9 @@ local sdk = dofile(script_dir .. "/sdk/init.lua")
 local default_code = default_config.code or {}
 local default_opt = default_config.opt or {}
 
+-- 临时保存请求信息 (用于 on_response 中保存 raw)
+local current_request = {}
+
 -------------------------------------------------------------------------------
 -- 初始化：将 config2.lua 配置写入 Redis
 -------------------------------------------------------------------------------
@@ -57,6 +60,15 @@ end
 -------------------------------------------------------------------------------
 -- 工具函数
 -------------------------------------------------------------------------------
+
+-- 保存原始请求/响应到 Redis (保留最近5个)
+local function save_raw_request(request, status, response)
+    local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+    local entry = '{"time":"' .. timestamp .. '","status":' .. status ..
+                  ',"request":' .. request .. ',"response":' .. response .. '}'
+    pcall(redis_lpush, "code:raw", entry)
+    pcall(redis_ltrim, "code:raw", 0, 4)  -- 只保留最近5个
+end
 
 -- 分割字符串
 local function split(str, sep)
@@ -219,6 +231,21 @@ function handler.on_request(method, path, headers, body)
     -- 初始化配置到 Redis
     init_config_to_redis()
 
+    -- /raw 端点：查看最近5个请求的原始数据
+    if path == "/raw" then
+        local ok, items = pcall(redis_lrange, "code:raw", 0, 4)
+        if ok and items then
+            local result = "["
+            for i, item in ipairs(items) do
+                if i > 1 then result = result .. "," end
+                result = result .. item
+            end
+            result = result .. "]"
+            return { action = "reject", status = 200, body = result }
+        end
+        return { action = "reject", status = 200, body = "[]" }
+    end
+
     -- URL 匹配：路径中包含 "code" 字样
     if not string.find(path, "code") then
         return {
@@ -278,6 +305,14 @@ function handler.on_request(method, path, headers, body)
     local count_key = "code:" .. selected .. ":calls"
     pcall(redis_incr, count_key)
 
+    -- 保存请求信息 (用于 on_response 中保存 raw)
+    current_request = {
+        body = new_body,
+        selected = selected,
+        provider = code_cfg.provider,
+        model = code_cfg.model
+    }
+
     -- 返回代理决策
     return {
         action = "proxy",
@@ -293,7 +328,17 @@ function handler.on_request(method, path, headers, body)
 end
 
 function handler.on_response(upstream, status, body)
-    -- 响应统计 (可选)
+    -- 保存原始请求/响应到 Redis
+    if current_request and current_request.body then
+        -- 尝试解析响应为 JSON，失败则用字符串
+        local response_json = body
+        if string.sub(body, 1, 1) == "{" or string.sub(body, 1, 1) == "[" then
+            response_json = body
+        else
+            response_json = '"' .. body:gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
+        end
+        save_raw_request(current_request.body, status, response_json)
+    end
 end
 
 function handler.on_error(upstream, err)

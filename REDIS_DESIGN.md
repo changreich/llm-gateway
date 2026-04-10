@@ -218,11 +218,18 @@ opt:02:stream → true
 | `code:{code}:completion` | Completion Token 累计 |
 | `code:{code}:total` | 总 Token 累计 |
 
+### Code 调试
+
+| Key | 说明 |
+|-----|------|
+| `code:raw` | 最近5个请求/响应记录 (List) |
+| `code:initialized` | 初始化标记 |
+
 ### Code 全局配置
 
 | Key | 说明 | 默认值 |
 |-----|------|--------|
-| `code:initialized` | 初始化标记 | `1` |
+| `code:select` | 当前选中序号 | `01` |
 
 ### 管理命令
 
