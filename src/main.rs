@@ -1052,18 +1052,44 @@ fn main() {
         }
     };
 
-    let _watcher = spawn_file_watcher(lua_runtime.clone(), script_path);
+    let _watcher = spawn_file_watcher(lua_runtime.clone(), script_path.clone());
+
+    // 第二个 Lua 运行时 (端口 9089)
+    let listen2 = std::env::var("LLM_LISTEN_2").unwrap_or_else(|_| "0.0.0.0:9089".to_string());
+    let script2 = std::env::var("LLM_SCRIPT_2").unwrap_or_else(|_| "lua/router2.lua".to_string());
+    let script_path2 = if PathBuf::from(&script2).is_absolute() {
+        PathBuf::from(&script2)
+    } else {
+        script_path.parent().map(|p| p.join(&script2)).unwrap_or_else(|| PathBuf::from(&script2))
+    };
+    info!("Script2: {:?}", script_path2);
+
+    let lua_runtime2 = match LuaRuntime::new(script_path2.clone()) {
+        Ok(rt) => Arc::new(RwLock::new(rt)),
+        Err(e) => {
+            error!("Lua2 init failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let _watcher2 = spawn_file_watcher(lua_runtime2.clone(), script_path2);
 
     let opt = Opt::parse_args();
     let mut server = Server::new(Some(opt)).unwrap();
     server.bootstrap();
 
+    // 主服务 (端口 9090)
     let gateway = LuaGateway::new(lua_runtime);
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, gateway);
     proxy_service.add_tcp(&listen);
-
     server.add_service(proxy_service);
-    info!("Listening on {}", listen);
+    info!("Listening on {} (router.lua)", listen);
+
+    // 第二服务 (端口 9089)
+    let gateway2 = LuaGateway::new(lua_runtime2);
+    let mut proxy_service2 = pingora_proxy::http_proxy_service(&server.configuration, gateway2);
+    proxy_service2.add_tcp(&listen2);
+    server.add_service(proxy_service2);
+    info!("Listening on {} (router2.lua)", listen2);
 
     // 启动独立的 stats HTTP 服务器 (9091 端口，完全绕过 Pingora/Lua)
     let stats_listen = std::env::var("LLM_STATS_LISTEN").unwrap_or_else(|_| "0.0.0.0:9091".to_string());

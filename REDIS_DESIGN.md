@@ -125,6 +125,120 @@ redis-cli -p 7379 DEL "llm:initialized"
 redis-cli -p 7379 SET "llm:01" "zhipu|GLM-4-Flash|0"
 ```
 
+## Code 路由配置 (端口 9089)
+
+### 设计说明
+
+端口 9089 使用 `code:` 前缀，URL 精确匹配包含 "code" 字样的路径。
+
+**URL 匹配规则**: 路径中包含 "code" 字样
+
+示例：
+- `/v1/code/chat/completions` → 匹配
+- `/api/code/embeddings` → 匹配
+- `/code/test` → 匹配
+
+**选择机制**: 通过 `code:select` 指定当前使用的序号（与 `llm:select` 逻辑相同）
+
+### Code 配置
+
+| Key | 格式 | 示例 |
+|-----|------|------|
+| `code:select` | 序号 | `01` |
+| `code:01` | `provider\|model\|opt` | `zhipu\|GLM-4-Flash\|01` |
+| `code:02` | `provider\|model\|opt` | `openai\|gpt-4o\|02` |
+
+**字段说明**:
+- `provider`: 提供商名称（复用 `provider:*` 配置）
+- `model`: 模型名称
+- `opt`: 选项编号，引用 `opt:*` 配置（空表示无选项）
+
+### Opt 选项配置
+
+| Key | 值 | 说明 |
+|-----|------|------|
+| `opt:01:max_tokens` | `999` | 设置 max_tokens |
+| `opt:01:temperature` | `0.7` | 设置 temperature |
+| `opt:01:stream` | `true` | 设置 stream |
+| `opt:02:max_tokens` | `800` | 另一组配置 |
+| `opt:02:top_p` | `0.9` | 设置 top_p |
+
+**格式**: `opt:{编号}:{JSON字段名}` → `{值}`
+
+**工作原理**:
+
+当请求 `/v1/code/chat/completions` 时：
+1. URL 包含 "code" → 走 code 路由
+2. 查询 `code:select` → `01`
+3. 查询 `code:01` → `zhipu|GLM-4-Flash|01+02`
+4. 解析 opt = `01+02`（多个选项用 `+` 分隔）
+5. 查询 `opt:01:*` 获取所有配置项
+6. 查询 `opt:02:*` 获取所有配置项
+7. **重建请求体**：用配置参数替换原请求中的对应字段
+8. 转发到 zhipu
+
+**请求体重建示例**:
+
+原请求体：
+```json
+{
+  "model": "some-model",
+  "messages": [...],
+  "max_tokens": 100,
+  "temperature": 1.0
+}
+```
+
+配置：
+```
+opt:01:max_tokens → 999
+opt:01:temperature → 0.7
+opt:02:stream → true
+```
+
+重建后请求体：
+```json
+{
+  "model": "GLM-4-Flash",
+  "messages": [...],
+  "max_tokens": 999,
+  "temperature": 0.7,
+  "stream": true
+}
+```
+
+**关键点**: 用配置参数**重建**请求体，覆盖原请求中的对应字段。
+
+### Code 统计
+
+| Key | 说明 |
+|-----|------|
+| `code:{code}:calls` | 调用次数 |
+| `code:{code}:prompt` | Prompt Token 累计 |
+| `code:{code}:completion` | Completion Token 累计 |
+| `code:{code}:total` | 总 Token 累计 |
+
+### Code 全局配置
+
+| Key | 说明 | 默认值 |
+|-----|------|--------|
+| `code:initialized` | 初始化标记 | `1` |
+
+### 管理命令
+
+```bash
+# 添加 code 配置
+redis-cli -p 7379 SET "code:test123" "zhipu|GLM-4-Flash|"
+
+# 查看所有 code
+redis-cli -p 7379 KEYS "code:*"
+
+# 查看 code 统计
+redis-cli -p 7379 GET "code:test123:calls"
+```
+
+---
+
 ## 配置示例
 
 ### 多提供商负载均衡
