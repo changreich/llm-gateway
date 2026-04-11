@@ -213,6 +213,30 @@ local function get_opt_config(opt_str)
     return result
 end
 
+-- 将 Anthropic 格式的 content 数组转为 OpenAI 字符串格式
+-- content: [{type:"text", text:"xxx"}, ...] -> content: "xxx"
+-- content: [{type:"text", text:"a"}, {type:"text", text:"b"}] -> content: "a\nb"
+-- content: "string" -> content: "string"
+local function normalize_content(content)
+    if type(content) == "string" then
+        return content
+    end
+    if type(content) == "table" then
+        local parts = {}
+        for i, item in ipairs(content) do
+            if type(item) == "string" then
+                table.insert(parts, item)
+            elseif type(item) == "table" and item.text then
+                table.insert(parts, item.text)
+            end
+        end
+        if #parts > 0 then
+            return table.concat(parts, "\n")
+        end
+    end
+    return content
+end
+
 -- 重建请求体
 local function rebuild_request_body(original_body, model, opt_config, provider_sdk, provider_cfg)
     -- 解析原请求体
@@ -226,9 +250,18 @@ local function rebuild_request_body(original_body, model, opt_config, provider_s
 
     -- 兼容 Anthropic 格式: messages 或 prompt
     if orig.messages then
-        new_body.messages = orig.messages
+        local normalized_msgs = {}
+        for i, msg in ipairs(orig.messages) do
+            local new_msg = {}
+            new_msg.role = msg.role
+            new_msg.content = normalize_content(msg.content)
+            if msg.name then
+                new_msg.name = msg.name
+            end
+            table.insert(normalized_msgs, new_msg)
+        end
+        new_body.messages = normalized_msgs
     elseif orig.prompt then
-        -- Anthropic 旧格式: prompt 是字符串或数组，转为 messages
         local prompt = orig.prompt
         if type(prompt) == "string" then
             new_body.messages = {{role = "user", content = prompt}}
@@ -241,7 +274,6 @@ local function rebuild_request_body(original_body, model, opt_config, provider_s
         end
     end
 
-    -- 如果没有 messages，尝试从其他字段构建
     if not new_body.messages and orig.content then
         new_body.messages = {{role = "user", content = orig.content}}
     end
@@ -249,9 +281,67 @@ local function rebuild_request_body(original_body, model, opt_config, provider_s
     -- 设置模型
     new_body.model = model
 
-    -- 应用 opt 配置
+    -- 透传通用参数
+    for _, field in ipairs({"max_tokens", "temperature", "top_p", "top_k", "stop", "presence_penalty", "frequency_penalty", "seed", "logprobs"}) do
+        if orig[field] ~= nil then
+            new_body[field] = orig[field]
+        end
+    end
+
+    -- 透传 system 消息 (Anthropic: system 字符串/数组 → OpenAI: system role message)
+    if orig.system then
+        if type(orig.system) == "string" then
+            table.insert(new_body.messages, 1, {role = "system", content = orig.system})
+        elseif type(orig.system) == "table" then
+            local parts = {}
+            for _, block in ipairs(orig.system) do
+                if type(block) == "string" then
+                    table.insert(parts, block)
+                elseif type(block) == "table" and block.text then
+                    table.insert(parts, block.text)
+                end
+            end
+            if #parts > 0 then
+                table.insert(new_body.messages, 1, {role = "system", content = table.concat(parts, "\n")})
+            end
+        end
+    end
+
+    -- 转换 Anthropic tools → OpenAI tools
+    if orig.tools then
+        local openai_tools = {}
+        for _, tool in ipairs(orig.tools) do
+            local openai_tool = {
+                ["type"] = "function",
+                ["function"] = {
+                    name = tool.name,
+                    description = tool.description or "",
+                    parameters = tool.input_schema or {}
+                }
+            }
+            table.insert(openai_tools, openai_tool)
+        end
+        new_body.tools = openai_tools
+    end
+
+    -- 透传 tool_choice
+    if orig.tool_choice then
+        if type(orig.tool_choice) == "string" then
+            if orig.tool_choice == "auto" then
+                new_body.tool_choice = "auto"
+            elseif orig.tool_choice == "any" then
+                new_body.tool_choice = "required"
+            end
+        elseif type(orig.tool_choice) == "table" and orig.tool_choice.name then
+            new_body.tool_choice = {["type"] = "function", ["function"] = {name = orig.tool_choice.name}}
+        end
+    end
+
+    -- 注意: 不转发 stream 参数，让上游返回非流式响应
+    -- Rust 端会检测原始请求的 stream 字段，包装为 SSE 返回
+
+    -- 应用 opt 配置 (覆盖上面透传的参数)
     for field, value in pairs(opt_config) do
-        -- 尝试转换数值
         local num = tonumber(value)
         if num then
             new_body[field] = num

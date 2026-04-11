@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use pingora_error::{Error, ErrorType, Result};
+use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use redis::Client;
 use std::collections::HashMap;
@@ -684,6 +685,204 @@ fn json_to_lua_deep(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Table> {
     }
 }
 
+/// OpenAI Chat Completion 响应 → Anthropic Message 响应
+fn transform_openai_to_anthropic(body: &str, original_model: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+
+    if v.get("object").and_then(|o| o.as_str()) != Some("chat.completion") {
+        return None;
+    }
+
+    let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
+    let model = original_model.unwrap_or_else(|| v.get("model").and_then(|m| m.as_str()).unwrap_or(""));
+
+    let msg = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"))?;
+
+    let mut content: Vec<serde_json::Value> = Vec::new();
+
+    // text content
+    if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+        if !text.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": text}));
+        }
+    }
+
+    // tool_calls → tool_use content blocks
+    if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+        for tc in tool_calls {
+            let tool_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let tool_name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+            let tool_input = tc.get("function").and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .unwrap_or(serde_json::json!({}));
+            content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": tool_id,
+                "name": tool_name,
+                "input": tool_input
+            }));
+        }
+    }
+
+    // fallback: empty content
+    if content.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": ""}));
+    }
+
+    let finish_reason = v.get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|f| f.as_str())
+        .unwrap_or("stop");
+
+    let stop_reason = match finish_reason {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        _ => "end_turn",
+    };
+
+    let input_tokens = v.get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|p| p.as_u64())
+        .unwrap_or(0);
+
+    let output_tokens = v.get("usage")
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+
+    let anthropic_response = serde_json::json!({
+        "id": format!("msg_{}", id.strip_prefix("chatcmpl-").unwrap_or(id)),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+
+    Some(serde_json::to_string(&anthropic_response).unwrap_or_default())
+}
+
+/// 将 Anthropic JSON 响应包装为 SSE 流格式
+/// 模拟 Anthropic 流式响应事件序列:
+///   message_start → content_block_start → content_block_delta(s) → content_block_stop → message_delta → message_stop
+fn wrap_as_sse(anthropic_json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(anthropic_json) {
+        Ok(v) => v,
+        Err(_) => return anthropic_json.to_string(),
+    };
+
+    let msg_id = v.get("id").and_then(|i| i.as_str()).unwrap_or("msg_unknown");
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let input_tokens = v.get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let output_tokens = v.get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+    let stop_reason = v.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("end_turn");
+
+    let mut sse = String::new();
+
+    // message_start
+    let message_start = serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": 0
+            }
+        }
+    });
+    sse.push_str(&format!("event: message_start\ndata: {}\n\n", message_start));
+
+    // content blocks
+    let content = v.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+    for (idx, block) in content.iter().enumerate() {
+        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+
+        // content_block_start
+        let start_block = if block_type == "text" {
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "text", "text": ""}
+            })
+        } else if block_type == "tool_use" {
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": block.get("id").and_then(|i| i.as_str()).unwrap_or(""),
+                    "name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                    "input": {}
+                }
+            })
+        } else {
+            serde_json::json!({"type": "content_block_start", "index": idx, "content_block": block})
+        };
+        sse.push_str(&format!("event: content_block_start\ndata: {}\n\n", start_block));
+
+        // content_block_delta
+        if block_type == "text" {
+            let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "text_delta", "text": text}
+            });
+            sse.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
+        } else if block_type == "tool_use" {
+            let input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
+            let input_str = serde_json::to_string(&input).unwrap_or_default();
+            let delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "input_json_delta", "partial_json": input_str}
+            });
+            sse.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
+        }
+
+        // content_block_stop
+        sse.push_str(&format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx));
+    }
+
+    // message_delta
+    let message_delta = serde_json::json!({
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": stop_reason,
+            "stop_sequence": null
+        },
+        "usage": {
+            "output_tokens": output_tokens
+        }
+    });
+    sse.push_str(&format!("event: message_delta\ndata: {}\n\n", message_delta));
+
+    // message_stop
+    sse.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+    sse
+}
+
 /// Lua Value 转 JSON Value
 fn lua_to_json(val: &mlua::Value) -> serde_json::Value {
     match val {
@@ -919,8 +1118,9 @@ impl ProxyHttp for LuaGateway {
                     req = req.header("Authorization", format!("Bearer {}", decision.api_key));
                 }
 
-                let host = decision.addr.split(':').next().unwrap_or(&decision.addr);
-                req = req.header("Host", host);
+                // Extract hostname only for Host header (strip path from addr like "opencode.ai/zen/go")
+                let host_only = decision.addr.split('/').next().unwrap_or(&decision.addr);
+                req = req.header("Host", host_only);
 
                 let response = req.send().await
                     .map_err(|e| Error::explain(ErrorType::InternalError, format!("upstream error: {}", e)))?;
@@ -931,9 +1131,45 @@ impl ProxyHttp for LuaGateway {
 
                 info!("Upstream response: status={}", status);
 
+                // 9089 端口始终将 OpenAI 响应转为 Anthropic 格式
+                let stream_requested = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
+                    .ok()
+                    .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+                    .unwrap_or(false);
+
+                let original_model = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
+                    .ok()
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()));
+
+                let final_response_body = if self.port == 9089 {
+                    match transform_openai_to_anthropic(&response_body, original_model.as_deref()) {
+                        Some(converted) => {
+                            if stream_requested {
+                                info!("Wrapping Anthropic response as SSE stream");
+                                wrap_as_sse(&converted)
+                            } else {
+                                info!("Transformed OpenAI response to Anthropic format");
+                                converted
+                            }
+                        }
+                        None => response_body.clone(),
+                    }
+                } else {
+                    response_body.clone()
+                };
+
                 // 返回响应 (先克隆用于回调)
-                let resp_body = Bytes::from(response_body.clone());
-                session.respond_error_with_body(status.as_u16(), resp_body).await?;
+                let resp_body = Bytes::from(final_response_body.clone());
+                if stream_requested && self.port == 9089 {
+                    let mut resp = ResponseHeader::build(200, None)?;
+                    resp.insert_header("Content-Type", "text/event-stream")?;
+                    resp.insert_header("Cache-Control", "no-cache")?;
+                    resp.insert_header("Connection", "keep-alive")?;
+                    session.write_response_header(Box::new(resp), false).await?;
+                    session.write_response_body(Some(resp_body), true).await?;
+                } else {
+                    session.respond_error_with_body(status.as_u16(), resp_body).await?;
+                }
 
                 ctx.response_status = status.as_u16();
 
