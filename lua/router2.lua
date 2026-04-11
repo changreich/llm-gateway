@@ -5,6 +5,7 @@
 --   - 通过 code:select 获取当前配置序号
 --   - 支持多 opt 组合 (01+02)
 --   - 重建请求体，覆盖原请求参数
+--   - 支持 Anthropic provider 直通（不转换格式）
 --   - 无负载均衡、无 fallback
 
 handler = {}
@@ -298,13 +299,95 @@ local function anthropic_content_to_openai(role, content, out_messages)
     return table.concat(text_parts, "\n"), tool_calls
 end
 
+--- 判断 provider 是否需要 Anthropic→OpenAI 格式转换
+-- provider 名称包含 "anthropic" → 不需要转换，直接透传
+-- @param provider_key string provider 名称 (如 "opengo", "anthropic")
+-- @return boolean true=需要转换, false=不需要转换
+local function needs_format_conversion(provider_key)
+    if not provider_key then
+        return true  -- 默认需要转换
+    end
+    local lower_key = string.lower(provider_key)
+    if string.find(lower_key, "anthropic") then
+        return false  -- Anthropic provider 不需要转换
+    end
+    return true  -- 其他 provider 需要转换为 OpenAI 格式
+end
+
+--- 检测请求体格式
+-- @param body string 请求体 JSON 字符串
+-- @return string "anthropic" | "openai" | "unknown"
+local function detect_request_format(body)
+    local ok, orig = pcall(json_decode, body)
+    if not ok or type(orig) ~= "table" then
+        return "unknown"
+    end
+    -- Anthropic 特征: prompt 字段 (且没有 messages)
+    if orig.prompt and not orig.messages then
+        return "anthropic"
+    end
+    -- Anthropic 特征: messages 中 content 是 table 数组 (含 type 字段)
+    if orig.messages then
+        for _, msg in ipairs(orig.messages) do
+            if type(msg.content) == "table" then
+                for _, block in ipairs(msg.content) do
+                    if type(block) == "table" and block.type then
+                        return "anthropic"
+                    end
+                end
+            end
+        end
+        return "openai"  -- 有 messages 但无 type → OpenAI
+    end
+    return "unknown"
+end
+
 -- 重建请求体
-local function rebuild_request_body(original_body, model, opt_config, provider_sdk, provider_cfg)
+local function rebuild_request_body(original_body, model, opt_config, provider_sdk, provider_cfg, provider_key)
     -- 解析原请求体
     local ok, orig = pcall(json_decode, original_body)
     if not ok or type(orig) ~= "table" then
         return nil
     end
+
+    -- ★ Anthropic provider 直通：不做格式转换，只替换模型名和应用 opt
+    if not needs_format_conversion(provider_key) then
+        local request_format = detect_request_format(original_body)
+        pcall(redis_set, "code:debug_format",
+            string.format("skip_conversion:provider=%s req_format=%s", provider_key, request_format))
+        local passthrough = {}
+        passthrough.model = model
+        for k, v in pairs(orig) do
+            if k ~= "model" then
+                passthrough[k] = v
+            end
+        end
+        -- 应用 opt 配置
+        for field, value in pairs(opt_config) do
+            local num = tonumber(value)
+            if field == "stream" then
+                passthrough.stream = (value == "true")
+            elseif num then
+                passthrough[field] = num
+            elseif value == "true" then
+                passthrough[field] = true
+            elseif value == "false" then
+                passthrough[field] = false
+            else
+                passthrough[field] = value
+            end
+        end
+        local passthrough_str = json_encode(passthrough)
+        if provider_sdk and provider_sdk.transform_request then
+            passthrough_str = provider_sdk.transform_request(passthrough_str, model, provider_cfg)
+        end
+        return passthrough_str
+    end
+
+    -- 需要转换：执行原有的 Anthropic → OpenAI 转换逻辑
+    local request_format = detect_request_format(original_body)
+    pcall(redis_set, "code:debug_format",
+        string.format("convert:provider=%s req_format=%s", provider_key, request_format))
 
     -- 创建新请求体
     local new_body = {}
@@ -529,7 +612,7 @@ function handler.on_request(method, path, headers, body)
     pcall(redis_set, "code:debug", "loaded sdk:" .. tostring(provider_sdk))
 
     -- 重建请求体
-    local new_body = rebuild_request_body(body, code_cfg.model, opt_config, provider_sdk, provider_cfg)
+    local new_body = rebuild_request_body(body, code_cfg.model, opt_config, provider_sdk, provider_cfg, code_cfg.provider)
     if not new_body then
         return {
             action = "reject",
@@ -573,6 +656,9 @@ function handler.on_request(method, path, headers, body)
     -- 保存转换后的请求到 Redis (code:raw2)
     save_translated_request(new_body, selected, code_cfg.provider, code_cfg.model)
 
+    -- ★ 是否需要格式转换 (Anthropic provider 不需要)
+    local need_transform = needs_format_conversion(code_cfg.provider)
+
     -- 返回代理决策
     return {
         action = "proxy",
@@ -583,7 +669,8 @@ function handler.on_request(method, path, headers, body)
         api_key = provider_cfg.apikey,
         model = code_cfg.model,
         rewrite_path = rewrite_path,
-        new_request_body = new_body
+        new_request_body = new_body,
+        need_transform = need_transform
     }
 end
 

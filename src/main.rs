@@ -644,6 +644,7 @@ impl LuaRuntime {
             rewrite_path: result.get("rewrite_path").unwrap_or_default(),
             response_body: result.get("body").unwrap_or_default(),
             new_request_body: result.get("new_request_body").unwrap_or_default(),
+            need_transform: result.get("need_transform").unwrap_or(true),  // 默认需要转换
         })
     }
 
@@ -921,7 +922,7 @@ struct TransformResult {
     compressed_tool_calls: Option<String>,
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 struct RequestDecision {
     action: String,
     upstream: String,
@@ -934,6 +935,26 @@ struct RequestDecision {
     rewrite_path: String,
     response_body: String,
     new_request_body: String,  // Lua 返回的新请求体
+    need_transform: bool,      // 是否需要格式转换 (Anthropic provider 直通时为 false)
+}
+
+impl Default for RequestDecision {
+    fn default() -> Self {
+        Self {
+            action: "proxy".to_string(),
+            upstream: String::new(),
+            status: 200,
+            addr: String::new(),
+            tls: false,
+            sni: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            rewrite_path: String::new(),
+            response_body: String::new(),
+            new_request_body: String::new(),
+            need_transform: true,  // 默认需要转换
+        }
+    }
 }
 
 struct GatewayCtx {
@@ -1097,32 +1118,45 @@ impl ProxyHttp for LuaGateway {
                     original_model.clone().unwrap_or_default()
                 };
 
-                // 构建请求体：9089 端口需要转换 Anthropic → OpenAI，流式时注入 stream:true
+                // 构建请求体：9089 端口根据 need_transform 决定是否转换
+                info!("[port:{}] need_transform={}, upstream={}", self.port, decision.need_transform, decision.upstream);
                 let request_body = if !decision.new_request_body.is_empty() {
                     if self.port == 9089 && stream_requested {
-                        match inject_stream_true(&decision.new_request_body) {
-                            Some(body) => body,
-                            None => decision.new_request_body.clone(),
+                        if decision.need_transform {
+                            // A→OpenAI 转换：注入 stream:true
+                            match inject_stream_true(&decision.new_request_body) {
+                                Some(body) => body,
+                                None => decision.new_request_body.clone(),
+                            }
+                        } else {
+                            // A→A 直通：Anthropic 格式已含 stream 字段
+                            decision.new_request_body.clone()
                         }
                     } else {
                         decision.new_request_body.clone()
                     }
                 } else if self.port == 9089 {
-                    match transform_anthropic_request_to_openai(
-                        &String::from_utf8_lossy(&body),
-                        &target_model_for_upstream,
-                    ) {
-                        Some(converted) => {
-                            if stream_requested {
-                                inject_stream_true(&converted).unwrap_or(converted)
-                            } else {
-                                converted
+                    if decision.need_transform {
+                        // 无 Lua 返回体 + 需要转换：Rust 层兜底转换
+                        match transform_anthropic_request_to_openai(
+                            &String::from_utf8_lossy(&body),
+                            &target_model_for_upstream,
+                        ) {
+                            Some(converted) => {
+                                if stream_requested {
+                                    inject_stream_true(&converted).unwrap_or(converted)
+                                } else {
+                                    converted
+                                }
+                            }
+                            None => {
+                                warn!("Rust-level Anthropic→OpenAI conversion failed, using raw body");
+                                String::from_utf8_lossy(&body).to_string()
                             }
                         }
-                        None => {
-                            warn!("Rust-level Anthropic→OpenAI conversion failed, using raw body");
-                            String::from_utf8_lossy(&body).to_string()
-                        }
+                    } else {
+                        // 无 Lua 返回体 + 不需要转换：直接透传
+                        String::from_utf8_lossy(&body).to_string()
                     }
                 } else {
                     String::from_utf8_lossy(&body).to_string()
@@ -1145,9 +1179,10 @@ impl ProxyHttp for LuaGateway {
                 req = req.header("Host", host_only);
 
                 // ============================================================
-                // 9089 端口 + 流式请求：真流式转换路径
+                // 9089 端口 + 流式请求：根据 need_transform 决定是否转换
                 // ============================================================
-                if self.port == 9089 && stream_requested {
+                if self.port == 9089 && stream_requested && decision.need_transform {
+                    // A→OpenAI 流式转换路径
                     // 注册 SSE 连接
                     let client_req_id = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
                         .ok()
@@ -1279,6 +1314,43 @@ impl ProxyHttp for LuaGateway {
                 }
 
                 // ============================================================
+                // 9089 端口 + 流式请求 + 不需要转换：直接透传 SSE 流
+                // ============================================================
+                if self.port == 9089 && stream_requested && !decision.need_transform {
+                    info!("[port:{}] A→A passthrough SSE stream", self.port);
+
+                    let response = req.send().await
+                        .map_err(|e| Error::explain(ErrorType::InternalError, format!("upstream error: {}", e)))?;
+                    let status = response.status();
+
+                    if !status.is_success() {
+                        let error_body = response.text().await.unwrap_or_default();
+                        let mut resp = ResponseHeader::build(status.as_u16(), None)?;
+                        resp.insert_header("Content-Type", "application/json")?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session.write_response_body(Some(Bytes::from(error_body)), true).await?;
+                        ctx.response_status = status.as_u16();
+                        return Ok(true);
+                    }
+
+                    // 直接透传 SSE 流
+                    let mut resp = ResponseHeader::build(200, None)?;
+                    resp.insert_header("Content-Type", "text/event-stream")?;
+                    resp.insert_header("Cache-Control", "no-cache")?;
+                    resp.insert_header("Connection", "keep-alive")?;
+                    session.write_response_header(Box::new(resp), false).await?;
+
+                    let mut stream_response = response;
+                    while let Some(chunk) = stream_response.chunk().await.map_err(|e| {
+                        Error::explain(ErrorType::InternalError, format!("passthrough chunk read error: {}", e))
+                    })? {
+                        session.write_response_body(Some(chunk), false).await?;
+                    }
+                    session.write_response_body(None, true).await?;
+                    return Ok(true);
+                }
+
+                // ============================================================
                 // 非流式路径：完整读取响应后转换
                 // ============================================================
                 let response = req.send().await
@@ -1290,7 +1362,7 @@ impl ProxyHttp for LuaGateway {
 
                 info!("Upstream response: status={}", status);
 
-                let final_response_body = if self.port == 9089 {
+                let final_response_body = if self.port == 9089 && decision.need_transform {
                     let lua = self.lua.read().unwrap();
 
                     match extract_openai_fields(&response_body) {
