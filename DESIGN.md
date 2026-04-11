@@ -2,32 +2,40 @@
 
 ## 概述
 
-LLM Gateway 是一个基于 Pingora + Lua + reqwest 的反向代理，支持 LLM 请求路由、主备切换、请求体重写。
+LLM Gateway 是一个基于 Pingora + Lua + reqwest 的反向代理，支持多端口路由、主备切换、Anthropic 格式支持。
 
 ## 架构
 
 ```
-客户端 → Pingora (接收请求) → Lua (路由决策) → reqwest (上游连接) → LLM API
-                                    ↓
-                              Redis (配置存储)
+客户端 → Pingora (端口 9090/9089) → Lua (router.lua/router2.lua) → reqwest (上游连接) → LLM API
+                                         ↓
+                                   Redis (配置存储)
 ```
+
+**双端口设计：**
+
+| 端口 | 路由脚本 | 用途 |
+|------|---------|------|
+| 9090 | `router.lua` | 通用路由（OpenAI 兼容 API） |
+| 9089 | `router2.lua` | Anthropic 专用路由 |
 
 **组件职责：**
 
 | 组件 | 职责 |
 |------|------|
-| Pingora | HTTP 服务器，接收请求、返回响应 |
+| Pingora | HTTP 服务器（双端口），接收请求、返回响应 |
 | Lua | 业务逻辑：配置加载、路由决策、请求体重写 |
 | reqwest | 上游 HTTPS 连接（rustls-tls） |
-| Redis | 配置存储、状态存储 |
+| Redis | 配置存储、状态存储、请求缓存 |
 
 ## 请求处理流程
 
 ```
-1. Pingora 接收 HTTP 请求
+1. Pingora 接收 HTTP 请求 (9090 或 9089)
 2. 读取请求体 (POST/PUT/PATCH)
-3. 调用 Lua handler.on_request(method, path, headers, body)
-4. Lua 返回决策：
+3. 根据端口加载对应的 Lua 脚本
+4. 调用 Lua handler.on_request(method, path, headers, body)
+5. Lua 返回决策：
    - action: "proxy" | "reject"
    - addr: 上游地址 (host:port)
    - tls: 是否使用 HTTPS
@@ -35,9 +43,27 @@ LLM Gateway 是一个基于 Pingora + Lua + reqwest 的反向代理，支持 LLM
    - api_key: Authorization 头
    - model: 目标模型 (用于替换请求体)
    - new_body: 替换后的请求体
-5. reqwest 发送请求到上游
-6. 返回响应给客户端
+6. reqwest 发送请求到上游
+7. 如果是 9089 端口，进行 Anthropic 格式转换
+8. 返回响应给客户端
 ```
+
+## Anthropic 格式转换 (9089 端口)
+
+9089 端口专门用于 Anthropic API 调用，支持：
+
+1. **请求体转换**: 将 OpenAI 格式转换为 Anthropic 格式
+   - `model` → `model`
+   - `messages` → `messages`
+   - `max_tokens` → `max_tokens`
+   - `stream` → `stream` (自动转换为 Anthropic Beta 头)
+
+2. **响应转换**: ��� Anthropic 压缩响应转换为 OpenAI 格式
+   - 使用 flate2 解压
+   - 拆分多 chunk 组装
+   - SSE 流式逐 chunk 转换
+
+3. **连接管理**: 使用连接注册表管理流式连接的生命周期
 
 ## Redis Key 设计
 
@@ -54,6 +80,7 @@ LLM Gateway 是一个基于 Pingora + Lua + reqwest 的反向代理，支持 LLM
 | `llm:config:cool_down` | `60` | 默认冷却期（秒） |
 | `llm:count:{num}` | `15` | LLM 调用次数 |
 | `llm:cool-down:{num}` | `timestamp` | 备用冷却期截止时间 |
+| `raw` | `[{...}, {...}, ...]` | 最近 5 个请求原始数据 (router2.lua) |
 
 ## 主备切换机制
 
@@ -107,9 +134,17 @@ return {
 | `/debug` | GET | 查看当前路由状态 |
 | `/settings` | GET | 查看当前配置项 |
 | `/config` | GET | 查看 LLM 配置 |
-| `/v1/chat/completions` | POST | Chat Completions API |
+| `/raw` | GET | 查看最近 5 个请求原始数据 (router2.lua) |
+| `/running` | GET | 运行统计 HTML 页面 |
+| `/v1/chat/completions` | POST | Chat Completions API (9090) |
+| `/openai/v1/chat/completions` | POST | Chat Completions API (9089) |
 | `/v1/embeddings` | POST | Embeddings API |
 | `/rerank` | POST | Rerank API |
+
+**端口 9090 vs 9089：**
+
+- 9090: 标准 OpenAI 兼容 API (`/v1/chat/completions`)
+- 9089: Anthropic 兼容 API (`/openai/v1/chat/completions`)，自动格式转换
 
 ## /debug 输出示例
 
@@ -126,7 +161,41 @@ return {
 }
 ```
 
-## 配置文件 (config.lua)
+## 配置文件 (config2.lua - Code 配置)
+
+router2.lua 使用独立的 config2.lua，支持 Code 选择：
+
+```lua
+return {
+    redis_host = "127.0.0.1",
+    redis_port = 7379,
+    redis_db = 0,
+
+    selected = "01",
+
+    -- Code 配置
+    code = {
+        ["01"] = {
+            provider = "opengo",
+            model = "glm-5.1",
+            opt = ""  -- 无选项
+        },
+        ["02"] = {
+            provider = "openzen",
+            model = "mimo-v2-pro-free",
+            opt = ""  -- 无选项
+        }
+    }
+}
+```
+
+**Redis Key 设计 (router2.lua):**
+
+| Key | 格式 | 说明 |
+|-----|------|------|
+| `code:{num}` | `provider\|model\|opt` | Code 配置 |
+| `opt:{id}:{field}` | `value` | 选项字段 |
+| `code:select` | `num` | 当前选中的编号 |
 
 ```lua
 return {
@@ -184,8 +253,10 @@ return {
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `REDIS_URL` | Redis 连接 URL | `redis://127.0.0.1:7379` |
-| `LLM_LISTEN` | 监听地址 | `0.0.0.0:9090` |
-| `LLM_SCRIPT` | Lua 脚本路径 | `lua/router.lua` |
+| `LLM_LISTEN` | 监听地址 (9090) | `0.0.0.0:9090` |
+| `LLM_LISTEN2` | 监听地址 (9089) | `0.0.0.0:9089` |
+| `LLM_SCRIPT` | Lua 脚本路径 (9090) | `lua/router.lua` |
+| `LLM_SCRIPT2` | Lua 脚本路径 (9089) | `lua/router2.lua` |
 | `LLM_TLS_VERIFY` | TLS 证书验证 (1=启用) | `0` (跳过) |
 | `LLM_BASEURL` | 默认 API 地址 | `https://api.anthropic.com` |
 | `LLM_API_KEY` | 默认 API Key | (空) |
