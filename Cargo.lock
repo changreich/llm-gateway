@@ -1257,8 +1257,10 @@ name = "llm-gateway"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "env_logger",
+ "flate2",
  "log",
  "mlua",
  "notify",

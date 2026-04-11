@@ -6,9 +6,17 @@
 //! Pingora 职责：接收请求 → 传给 Lua (header) → 执行决策 → 上报响应
 //! Lua 职责：Redis 配置读取、URL 重写、Token 统计
 
+mod anthropic_convert;
+use anthropic_convert::{
+    extract_error_message, extract_openai_fields, transform_anthropic_request_to_openai,
+    transform_openai_to_anthropic, wrap_as_sse, convert_openai_content_to_anthropic,
+    convert_openai_tool_calls_to_anthropic, decompress_field, assemble_anthropic_response,
+    anthropic_error_response,
+};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::{error, info};
+use log::{error, info, warn};
 use mlua::{Lua, ObjectLike, Table};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
@@ -629,6 +637,60 @@ impl LuaRuntime {
             let _ = handler.call_method::<()>("on_error", (upstream, error_msg));
         }
     }
+
+    /// 调用 Lua 的 on_transform_response，完成简单字段映射
+    /// 返回 (id, model, stop_reason, input_tokens, output_tokens, compressed_content, compressed_tool_calls)
+    fn call_on_transform_response(
+        &self,
+        id: &str,
+        model: &str,
+        finish_reason: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        compressed_content: Option<&str>,
+        compressed_tool_calls: Option<&str>,
+    ) -> Option<TransformResult> {
+        if let Ok(handler) = self.lua.globals().get::<Table>("handler") {
+            match handler.get::<mlua::Function>("on_transform_response") {
+                Ok(func) => {
+                    let comp_content = compressed_content.unwrap_or("");
+                    let comp_tc = compressed_tool_calls.unwrap_or("");
+                    match func.call::<Table>((id, model, finish_reason, input_tokens, output_tokens, comp_content, comp_tc)) {
+                        Ok(table) => {
+                            let result_id: String = table.get("id").unwrap_or_else(|_| id.to_string());
+                            let result_model: String = table.get("model").unwrap_or_else(|_| model.to_string());
+                            let result_stop_reason: String = table.get("stop_reason").unwrap_or_else(|_| "end_turn".to_string());
+                            let result_input_tokens: u64 = table.get("input_tokens").unwrap_or(input_tokens);
+                            let result_output_tokens: u64 = table.get("output_tokens").unwrap_or(output_tokens);
+                            let result_compressed_content: String = table.get("compressed_content").unwrap_or_default();
+                            let result_compressed_tool_calls: String = table.get("compressed_tool_calls").unwrap_or_default();
+
+                            Some(TransformResult {
+                                id: result_id,
+                                model: result_model,
+                                stop_reason: result_stop_reason,
+                                input_tokens: result_input_tokens,
+                                output_tokens: result_output_tokens,
+                                compressed_content: if result_compressed_content.is_empty() { None } else { Some(result_compressed_content) },
+                                compressed_tool_calls: if result_compressed_tool_calls.is_empty() { None } else { Some(result_compressed_tool_calls) },
+                            })
+                        }
+                        Err(e) => {
+                            error!("on_transform_response call failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("on_transform_response function not found: {}", e);
+                    None
+                }
+            }
+        } else {
+            error!("handler table not found");
+            None
+        }
+    }
 }
 
 /// JSON Value 转 Lua Table (深度递归版，支持嵌套对象和数组)
@@ -683,204 +745,6 @@ fn json_to_lua_deep(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Table> {
             Ok(table)
         }
     }
-}
-
-/// OpenAI Chat Completion 响应 → Anthropic Message 响应
-fn transform_openai_to_anthropic(body: &str, original_model: Option<&str>) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-
-    if v.get("object").and_then(|o| o.as_str()) != Some("chat.completion") {
-        return None;
-    }
-
-    let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
-    let model = original_model.unwrap_or_else(|| v.get("model").and_then(|m| m.as_str()).unwrap_or(""));
-
-    let msg = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"))?;
-
-    let mut content: Vec<serde_json::Value> = Vec::new();
-
-    // text content
-    if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-        if !text.is_empty() {
-            content.push(serde_json::json!({"type": "text", "text": text}));
-        }
-    }
-
-    // tool_calls → tool_use content blocks
-    if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
-        for tc in tool_calls {
-            let tool_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
-            let tool_name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-            let tool_input = tc.get("function").and_then(|f| f.get("arguments"))
-                .and_then(|a| a.as_str())
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .unwrap_or(serde_json::json!({}));
-            content.push(serde_json::json!({
-                "type": "tool_use",
-                "id": tool_id,
-                "name": tool_name,
-                "input": tool_input
-            }));
-        }
-    }
-
-    // fallback: empty content
-    if content.is_empty() {
-        content.push(serde_json::json!({"type": "text", "text": ""}));
-    }
-
-    let finish_reason = v.get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(|f| f.as_str())
-        .unwrap_or("stop");
-
-    let stop_reason = match finish_reason {
-        "stop" => "end_turn",
-        "length" => "max_tokens",
-        "tool_calls" => "tool_use",
-        _ => "end_turn",
-    };
-
-    let input_tokens = v.get("usage")
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(|p| p.as_u64())
-        .unwrap_or(0);
-
-    let output_tokens = v.get("usage")
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(|c| c.as_u64())
-        .unwrap_or(0);
-
-    let anthropic_response = serde_json::json!({
-        "id": format!("msg_{}", id.strip_prefix("chatcmpl-").unwrap_or(id)),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": model,
-        "stop_reason": stop_reason,
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
-    });
-
-    Some(serde_json::to_string(&anthropic_response).unwrap_or_default())
-}
-
-/// 将 Anthropic JSON 响应包装为 SSE 流格式
-/// 模拟 Anthropic 流式响应事件序列:
-///   message_start → content_block_start → content_block_delta(s) → content_block_stop → message_delta → message_stop
-fn wrap_as_sse(anthropic_json: &str) -> String {
-    let v: serde_json::Value = match serde_json::from_str(anthropic_json) {
-        Ok(v) => v,
-        Err(_) => return anthropic_json.to_string(),
-    };
-
-    let msg_id = v.get("id").and_then(|i| i.as_str()).unwrap_or("msg_unknown");
-    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("");
-    let input_tokens = v.get("usage")
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0);
-    let output_tokens = v.get("usage")
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(|t| t.as_u64())
-        .unwrap_or(0);
-    let stop_reason = v.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("end_turn");
-
-    let mut sse = String::new();
-
-    // message_start
-    let message_start = serde_json::json!({
-        "type": "message_start",
-        "message": {
-            "id": msg_id,
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": model,
-            "stop_reason": null,
-            "stop_sequence": null,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": 0
-            }
-        }
-    });
-    sse.push_str(&format!("event: message_start\ndata: {}\n\n", message_start));
-
-    // content blocks
-    let content = v.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
-    for (idx, block) in content.iter().enumerate() {
-        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
-
-        // content_block_start
-        let start_block = if block_type == "text" {
-            serde_json::json!({
-                "type": "content_block_start",
-                "index": idx,
-                "content_block": {"type": "text", "text": ""}
-            })
-        } else if block_type == "tool_use" {
-            serde_json::json!({
-                "type": "content_block_start",
-                "index": idx,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": block.get("id").and_then(|i| i.as_str()).unwrap_or(""),
-                    "name": block.get("name").and_then(|n| n.as_str()).unwrap_or(""),
-                    "input": {}
-                }
-            })
-        } else {
-            serde_json::json!({"type": "content_block_start", "index": idx, "content_block": block})
-        };
-        sse.push_str(&format!("event: content_block_start\ndata: {}\n\n", start_block));
-
-        // content_block_delta
-        if block_type == "text" {
-            let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
-            let delta = serde_json::json!({
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": {"type": "text_delta", "text": text}
-            });
-            sse.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
-        } else if block_type == "tool_use" {
-            let input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
-            let input_str = serde_json::to_string(&input).unwrap_or_default();
-            let delta = serde_json::json!({
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": {"type": "input_json_delta", "partial_json": input_str}
-            });
-            sse.push_str(&format!("event: content_block_delta\ndata: {}\n\n", delta));
-        }
-
-        // content_block_stop
-        sse.push_str(&format!("event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{}}}\n\n", idx));
-    }
-
-    // message_delta
-    let message_delta = serde_json::json!({
-        "type": "message_delta",
-        "delta": {
-            "stop_reason": stop_reason,
-            "stop_sequence": null
-        },
-        "usage": {
-            "output_tokens": output_tokens
-        }
-    });
-    sse.push_str(&format!("event: message_delta\ndata: {}\n\n", message_delta));
-
-    // message_stop
-    sse.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
-
-    sse
 }
 
 /// Lua Value 转 JSON Value
@@ -986,6 +850,17 @@ fn generate_running_html() -> String {
 {}</table></div>
 <p style="color:#999;text-align:center;margin-top:20px">LLM Gateway | <a href="/debug">debug</a> | <a href="/config">config</a> | <a href="/raw">raw</a></p>
 </body></html>"#, total_calls, total_prompt, total_completion, total_tokens, model_rows)
+}
+
+#[derive(Clone, Default, Debug)]
+struct TransformResult {
+    id: String,
+    model: String,
+    stop_reason: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    compressed_content: Option<String>,
+    compressed_tool_calls: Option<String>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -1104,8 +979,24 @@ impl ProxyHttp for LuaGateway {
                     .build()
                     .map_err(|e| Error::explain(ErrorType::InternalError, format!("create client: {}", e)))?;
 
-                let request_body = if !decision.new_request_body.is_empty() {
+let request_body = if !decision.new_request_body.is_empty() {
+                    // Lua 层转换结果（小请求体）
                     decision.new_request_body.clone()
+                } else if self.port == 9089 && body.len() > 2048 {
+                    // 大请求体直接在 Rust 层转换，绕过 Lua JSON 编解码瓶颈
+                    let model = decision.model.clone();
+                    match transform_anthropic_request_to_openai(
+                        &String::from_utf8_lossy(&body), &model
+                    ) {
+                        Some(converted) => {
+                            info!("Rust-level Anthropic→OpenAI conversion ({} bytes)", converted.len());
+                            converted
+                        }
+                        None => {
+                            warn!("Rust-level Anthropic→OpenAI conversion failed, using raw body");
+                            String::from_utf8_lossy(&body).to_string()
+                        }
+                    }
                 } else {
                     String::from_utf8_lossy(&body).to_string()
                 };
@@ -1131,7 +1022,8 @@ impl ProxyHttp for LuaGateway {
 
                 info!("Upstream response: status={}", status);
 
-                // 9089 端口始终将 OpenAI 响应转为 Anthropic 格式
+                // 9089 端口：分层处理 OpenAI → Anthropic 响应转换
+                // Rust 提取字段 → Lua 做简单映射 → Rust 解压+组装
                 let stream_requested = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
                     .ok()
                     .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
@@ -1142,17 +1034,97 @@ impl ProxyHttp for LuaGateway {
                     .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()));
 
                 let final_response_body = if self.port == 9089 {
-                    match transform_openai_to_anthropic(&response_body, original_model.as_deref()) {
-                        Some(converted) => {
-                            if stream_requested {
-                                info!("Wrapping Anthropic response as SSE stream");
-                                wrap_as_sse(&converted)
-                            } else {
-                                info!("Transformed OpenAI response to Anthropic format");
-                                converted
+                    let lua = self.lua.read().unwrap();
+
+                    // Step 1: Rust 提取 OpenAI 响应字段，压缩大字段
+                    match extract_openai_fields(&response_body) {
+                        Some(fields) => {
+                            // Step 2: 调用 Lua 做简单字段映射
+                            let lua_result = lua.call_on_transform_response(
+                                &fields.id,
+                                &fields.model,
+                                &fields.finish_reason,
+                                fields.input_tokens,
+                                fields.output_tokens,
+                                fields.compressed_content.as_deref(),
+                                fields.compressed_tool_calls.as_deref(),
+                            );
+
+                            match lua_result {
+                                Some(lr) => {
+                                    // Step 3: Rust 解压 content/tool_calls，做结构转换，组装响应
+                                    let mut content_blocks = Vec::new();
+
+                                    // 解压并转换 content
+                                    if let Some(ref comp_content) = lr.compressed_content {
+                                        if let Some(content_val) = decompress_field(comp_content) {
+                                            let text = content_val.as_str().unwrap_or("");
+                                            if !text.is_empty() {
+                                                content_blocks.extend(convert_openai_content_to_anthropic(text));
+                                            }
+                                        }
+                                    }
+
+                                    // 解压并转换 tool_calls
+                                    if let Some(ref comp_tc) = lr.compressed_tool_calls {
+                                        if let Some(tc_val) = decompress_field(comp_tc) {
+                                            if let Some(tc_arr) = tc_val.as_array() {
+                                                let tool_use_blocks = convert_openai_tool_calls_to_anthropic(tc_arr);
+                                                content_blocks.extend(tool_use_blocks);
+                                            }
+                                        }
+                                    }
+
+                                    // fallback
+                                    if content_blocks.is_empty() {
+                                        content_blocks.push(serde_json::json!({"type": "text", "text": ""}));
+                                    }
+
+                                    let anthropic_json = assemble_anthropic_response(
+                                        &lr.id,
+                                        &lr.model,
+                                        &lr.stop_reason,
+                                        lr.input_tokens,
+                                        lr.output_tokens,
+                                        content_blocks,
+                                    );
+
+                                    if stream_requested {
+                                        info!("Wrapping Anthropic response as SSE stream (via Lua+Rust pipeline)");
+                                        wrap_as_sse(&anthropic_json)
+                                    } else {
+                                        info!("Transformed OpenAI response to Anthropic format (via Lua+Rust pipeline)");
+                                        anthropic_json
+                                    }
+                                }
+                                None => {
+                                    // Lua 回调失败，降级到 Rust 直接转换
+                                    info!("Lua on_transform_response failed, falling back to direct transform");
+                                    match transform_openai_to_anthropic(&response_body, original_model.as_deref()) {
+                                        Some(converted) => {
+                                            if stream_requested {
+                                                wrap_as_sse(&converted)
+                                            } else {
+                                                converted
+                                            }
+                                        }
+                                        None => {
+                                            let model_str = original_model.as_deref().unwrap_or("");
+                                            let error_msg = extract_error_message(&response_body);
+                                            info!("Upstream non-OpenAI response, wrapping as Anthropic error: {}", error_msg);
+                                            anthropic_error_response(&error_msg, model_str)
+                                        }
+                                    }
+                                }
                             }
                         }
-                        None => response_body.clone(),
+                        None => {
+                            // 非 OpenAI 格式响应（上游错误），包装为 Anthropic 错误格式
+                            let model_str = original_model.as_deref().unwrap_or("");
+                            let error_msg = extract_error_message(&response_body);
+                            info!("Upstream non-OpenAI response, wrapping as Anthropic error: {}", error_msg);
+                            anthropic_error_response(&error_msg, model_str)
+                        }
                     }
                 } else {
                     response_body.clone()

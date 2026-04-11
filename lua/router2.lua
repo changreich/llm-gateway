@@ -517,3 +517,34 @@ end
 function handler.on_error(upstream, err)
     -- 错误处理
 end
+
+-- Rust 层调用：OpenAI 响应简单字段映射
+-- 参数: id, model, finish_reason, input_tokens, output_tokens, compressed_content, compressed_tool_calls
+-- compressed_content / compressed_tool_calls 是 gzip+base64 编码的大字段，Lua 原样回传
+function handler.on_transform_response(id, model, finish_reason, input_tokens, output_tokens, compressed_content, compressed_tool_calls)
+    -- id 前缀映射: chatcmpl-xxx → msg_xxx
+    local msg_id = id
+    if id:find("chatcmpl-") == 1 then
+        msg_id = "msg_" .. id:sub(9)
+    end
+
+    -- finish_reason → stop_reason
+    local stop_reason = "end_turn"
+    if finish_reason == "length" then
+        stop_reason = "max_tokens"
+    elseif finish_reason == "tool_calls" then
+        stop_reason = "tool_use"
+    end
+
+    -- model 保持原始请求的 model (Rust 传入的 model 就是原始请求的 model)
+
+    return {
+        id = msg_id,
+        model = model,
+        stop_reason = stop_reason,
+        input_tokens = input_tokens,
+        output_tokens = output_tokens,
+        compressed_content = compressed_content,
+        compressed_tool_calls = compressed_tool_calls
+    }
+end
