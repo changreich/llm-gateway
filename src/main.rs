@@ -127,6 +127,33 @@ fn get_redis_conn() -> Option<RedisConnGuard<'static>> {
     REDIS_POOL.get()
 }
 
+fn get_selected_code_target() -> Option<(String, String, String)> {
+    let mut conn = get_redis_conn()?;
+    let selected = redis::cmd("GET")
+        .arg("code:select")
+        .query::<Option<String>>(&mut conn)
+        .ok()
+        .flatten()?;
+    if selected.is_empty() {
+        return None;
+    }
+
+    let code_key = format!("code:{}", selected);
+    let code_cfg = redis::cmd("GET")
+        .arg(&code_key)
+        .query::<Option<String>>(&mut conn)
+        .ok()
+        .flatten()?;
+
+    let mut parts = code_cfg.split('|');
+    let provider = parts.next().unwrap_or("").to_string();
+    let model = parts.next().unwrap_or("").to_string();
+    if provider.is_empty() && model.is_empty() {
+        return None;
+    }
+    Some((selected, provider, model))
+}
+
 /// TLS 证书验证开关 (默认跳过，因为有透明代理)
 static SKIP_TLS_VERIFY: Lazy<bool> = Lazy::new(|| {
     std::env::var("LLM_TLS_VERIFY").map(|v| v != "0" && v != "false").unwrap_or(false)
@@ -1034,6 +1061,42 @@ impl ProxyHttp for LuaGateway {
                     .ok()
                     .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()));
 
+                let selected_code_target = if self.port == 9089 {
+                    get_selected_code_target()
+                } else {
+                    None
+                };
+                if let Some((selected, provider, model)) = &selected_code_target {
+                    info!(
+                        "[port:{}] code:select={} -> provider={}, model={}",
+                        self.port, selected, provider, model
+                    );
+                    if !provider.is_empty() && *provider != decision.upstream {
+                        warn!(
+                            "[port:{}] code:select provider({}) differs from lua upstream({})",
+                            self.port, provider, decision.upstream
+                        );
+                    }
+                    if !model.is_empty() && !decision.model.is_empty() && *model != decision.model {
+                        warn!(
+                            "[port:{}] code:select model({}) differs from lua model({})",
+                            self.port, model, decision.model
+                        );
+                    }
+                }
+
+                let selected_model = selected_code_target
+                    .as_ref()
+                    .map(|(_, _, m)| m.clone())
+                    .unwrap_or_default();
+                let target_model_for_upstream = if !decision.model.is_empty() {
+                    decision.model.clone()
+                } else if !selected_model.is_empty() {
+                    selected_model.clone()
+                } else {
+                    original_model.clone().unwrap_or_default()
+                };
+
                 // 构建请求体：9089 端口需要转换 Anthropic → OpenAI，流式时注入 stream:true
                 let request_body = if !decision.new_request_body.is_empty() {
                     if self.port == 9089 && stream_requested {
@@ -1044,10 +1107,10 @@ impl ProxyHttp for LuaGateway {
                     } else {
                         decision.new_request_body.clone()
                     }
-                } else if self.port == 9089 && body.len() > 2048 {
-                    let model = decision.model.clone();
+                } else if self.port == 9089 {
                     match transform_anthropic_request_to_openai(
-                        &String::from_utf8_lossy(&body), &model
+                        &String::from_utf8_lossy(&body),
+                        &target_model_for_upstream,
                     ) {
                         Some(converted) => {
                             if stream_requested {
@@ -1096,7 +1159,7 @@ impl ProxyHttp for LuaGateway {
                     let conn_id = sse_register(
                         client_req_id,
                         String::new(), // openai_sse_id 在首个 chunk 时更新
-                        original_model.as_deref().unwrap_or("unknown").to_string(),
+                        target_model_for_upstream.clone(),
                     );
 
                     let response = req.send().await
@@ -1131,7 +1194,13 @@ impl ProxyHttp for LuaGateway {
                     }
 
                     // 上游成功，开始真流式转换
-                    info!("[SSE-REG#{}] Starting SSE stream transformation (model={}, active={})", conn_id, original_model.as_deref().unwrap_or("unknown"), sse_active_count());
+                    info!(
+                        "[SSE-REG#{}] Starting SSE stream transformation (client_model={}, upstream_model={}, active={})",
+                        conn_id,
+                        original_model.as_deref().unwrap_or("unknown"),
+                        target_model_for_upstream,
+                        sse_active_count()
+                    );
 
                     let mut resp = ResponseHeader::build(200, None)?;
                     resp.insert_header("Content-Type", "text/event-stream")?;
@@ -1139,7 +1208,11 @@ impl ProxyHttp for LuaGateway {
                     resp.insert_header("Connection", "keep-alive")?;
                     session.write_response_header(Box::new(resp), false).await?;
 
-                    let mut state = new_sse_stream_state(original_model.unwrap_or_default());
+                    let mut state = new_sse_stream_state(
+                        original_model
+                            .clone()
+                            .unwrap_or_else(|| target_model_for_upstream.clone()),
+                    );
                     let mut sse_parser = SseLineParser::new();
                     let mut stream_done = false;
 

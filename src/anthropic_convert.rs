@@ -391,41 +391,100 @@ pub fn wrap_as_sse(anthropic_json: &str) -> String {
 // Anthropic 请求 → OpenAI 请求转换
 // =====================================================================
 
-/// Anthropic content blocks → OpenAI content string
-fn anthropic_content_to_openai(blocks: &[Value]) -> Value {
-    if blocks.len() == 1 {
-        if let Some(text) = blocks[0].get("text").and_then(|t| t.as_str()) {
-            if blocks[0].get("type").and_then(|t| t.as_str()) == Some("text") {
-                return Value::String(text.to_string());
+fn tool_result_content_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Anthropic content blocks -> OpenAI content/tool_calls/tool messages
+fn anthropic_content_to_openai(role: &str, blocks: &[Value]) -> (Value, Vec<Value>, Vec<Value>) {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut multipart_parts: Vec<Value> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut tool_messages: Vec<Value> = Vec::new();
+    let mut has_non_text_part = false;
+
+    for b in blocks {
+        let block_type = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match block_type {
+            "text" => {
+                let t = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                text_parts.push(t.to_string());
+                multipart_parts.push(json!({"type": "text", "text": t}));
             }
+            "image" if role == "user" => {
+                if let Some(source) = b.get("source") {
+                    let image_url = match source.get("type").and_then(|t| t.as_str()) {
+                        Some("base64") => {
+                            let media = source
+                                .get("media_type")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("image/jpeg");
+                            let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                            if data.is_empty() {
+                                None
+                            } else {
+                                Some(format!("data:{};base64,{}", media, data))
+                            }
+                        }
+                        Some("url") => source
+                            .get("url")
+                            .and_then(|u| u.as_str())
+                            .map(|s| s.to_string()),
+                        _ => None,
+                    };
+                    if let Some(url) = image_url {
+                        has_non_text_part = true;
+                        multipart_parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {"url": url}
+                        }));
+                    }
+                }
+            }
+            "tool_use" if role == "assistant" => {
+                let tool_id = b.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let tool_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = b.get("input").cloned().unwrap_or_else(|| json!({}));
+                tool_calls.push(json!({
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
+                    }
+                }));
+            }
+            "tool_result" if role == "user" => {
+                let tool_call_id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                let content = b
+                    .get("content")
+                    .map(tool_result_content_to_string)
+                    .unwrap_or_default();
+                tool_messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content
+                }));
+            }
+            _ => {}
         }
     }
 
-    let parts: Vec<String> = blocks
-        .iter()
-        .filter_map(|b| {
-            b.get("text")
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
-    if !parts.is_empty() {
-        return Value::String(parts.join("\n"));
-    }
+    let content = if has_non_text_part {
+        Value::Array(multipart_parts)
+    } else {
+        Value::String(text_parts.join("\n"))
+    };
 
-    let results: Vec<String> = blocks
-        .iter()
-        .filter_map(|b| {
-            b.get("content")
-                .and_then(|c| c.as_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
-    if !results.is_empty() {
-        return Value::String(results.join("\n"));
-    }
-
-    Value::String(String::new())
+    (content, tool_calls, tool_messages)
 }
 
 /// 将 Anthropic 格式请求体转为 OpenAI 格式
@@ -469,58 +528,35 @@ pub fn transform_anthropic_request_to_openai(body: &str, model: &str) -> Option<
             let openai_content = match content {
                 Some(Value::String(s)) => Value::String(s.clone()),
                 Some(Value::Array(arr)) => {
-                    let has_tool_result = arr
-                        .iter()
-                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
-                    if has_tool_result {
-                        let tool_parts: Vec<Value> = arr
+                    let (content_val, tool_calls, tool_messages) =
+                        anthropic_content_to_openai(role, arr);
+                    for m in tool_messages {
+                        messages.push(m);
+                    }
+                    let only_tool_result = role == "user"
+                        && arr
                             .iter()
-                            .filter_map(|b| {
-                                let block_type =
-                                    b.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                match block_type {
-                                    "tool_result" => {
-                                        let tool_use_id = b
-                                            .get("tool_use_id")
-                                            .and_then(|i| i.as_str())
-                                            .unwrap_or("");
-                                        let tool_content = b.get("content");
-                                        let content_str = match tool_content {
-                                            Some(Value::String(s)) => s.clone(),
-                                            Some(Value::Array(blocks)) => blocks
-                                                .iter()
-                                                .filter_map(|bl| {
-                                                    bl.get("text")
-                                                        .and_then(|t| t.as_str())
-                                                        .map(|s| s.to_string())
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join("\n"),
-                                            _ => String::new(),
-                                        };
-                                        Some(json!({
-                                            "role": "tool",
-                                            "tool_call_id": tool_use_id,
-                                            "content": content_str
-                                        }))
-                                    }
-                                    "text" => {
-                                        let text =
-                                            b.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                                        Some(json!({"role": role, "content": text}))
-                                    }
-                                    _ => None,
-                                }
-                            })
-                            .collect();
-
-                        for part in &tool_parts {
-                            messages.push(part.clone());
-                        }
+                            .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+                    if only_tool_result {
                         continue;
                     }
-
-                    anthropic_content_to_openai(arr)
+                    if role == "assistant" && !tool_calls.is_empty() {
+                        let mut assistant_msg =
+                            json!({"role": "assistant", "content": content_val});
+                        if let Some(obj) = assistant_msg.as_object_mut() {
+                            obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                            if obj
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|s| s.is_empty())
+                            {
+                                obj.remove("content");
+                            }
+                        }
+                        messages.push(assistant_msg);
+                        continue;
+                    }
+                    content_val
                 }
                 Some(other) => other.clone(),
                 None => Value::String(String::new()),
@@ -541,7 +577,6 @@ pub fn transform_anthropic_request_to_openai(body: &str, model: &str) -> Option<
         "max_tokens",
         "temperature",
         "top_p",
-        "stop",
         "presence_penalty",
         "frequency_penalty",
         "seed",
@@ -550,6 +585,12 @@ pub fn transform_anthropic_request_to_openai(body: &str, model: &str) -> Option<
         if let Some(val) = v.get(*key) {
             openai.insert((*key).into(), val.clone());
         }
+    }
+
+    if let Some(stop_sequences) = v.get("stop_sequences") {
+        openai.insert("stop".into(), stop_sequences.clone());
+    } else if let Some(stop) = v.get("stop") {
+        openai.insert("stop".into(), stop.clone());
     }
 
     // tools: Anthropic → OpenAI function calling
@@ -581,7 +622,16 @@ pub fn transform_anthropic_request_to_openai(body: &str, model: &str) -> Option<
                 _ => json!("auto"),
             },
             Value::Object(m) => {
-                if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                let tc_type = m.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if tc_type == "auto" {
+                    json!("auto")
+                } else if tc_type == "tool" {
+                    if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                        json!({"type": "function", "function": {"name": name}})
+                    } else {
+                        json!("auto")
+                    }
+                } else if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
                     json!({"type": "function", "function": {"name": name}})
                 } else {
                     json!("auto")
@@ -638,4 +688,73 @@ pub fn anthropic_error_response(error_msg: &str, model: &str) -> String {
             error_msg
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transform_request_stop_sequences_and_tool_choice() {
+        let body = r#"{
+            "model": "claude-x",
+            "messages": [{"role": "user", "content": [{"type":"text","text":"hi"}]}],
+            "stop_sequences": ["END"],
+            "tool_choice": {"type":"tool", "name":"get_weather"},
+            "top_k": 10
+        }"#;
+
+        let out = transform_anthropic_request_to_openai(body, "upstream-model").unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(
+            v.get("model").and_then(|m| m.as_str()),
+            Some("upstream-model")
+        );
+        assert_eq!(
+            v.get("stop")
+                .and_then(|s| s.get(0))
+                .and_then(|s| s.as_str()),
+            Some("END")
+        );
+        assert!(v.get("top_k").is_none());
+        assert_eq!(
+            v.get("tool_choice")
+                .and_then(|tc| tc.get("function"))
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str()),
+            Some("get_weather")
+        );
+    }
+
+    #[test]
+    fn test_transform_request_tool_use_and_tool_result() {
+        let body = r#"{
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type":"tool_use","id":"toolu_1","name":"sum","input":{"a":1}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{"type":"tool_result","tool_use_id":"toolu_1","content":"2"}]
+                }
+            ]
+        }"#;
+
+        let out = transform_anthropic_request_to_openai(body, "m").unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let msgs = v.get("messages").and_then(|m| m.as_array()).unwrap();
+
+        assert_eq!(
+            msgs[0].get("role").and_then(|r| r.as_str()),
+            Some("assistant")
+        );
+        assert!(msgs[0].get("tool_calls").is_some());
+        assert_eq!(msgs[1].get("role").and_then(|r| r.as_str()), Some("tool"));
+        assert_eq!(
+            msgs[1].get("tool_call_id").and_then(|id| id.as_str()),
+            Some("toolu_1")
+        );
+    }
 }

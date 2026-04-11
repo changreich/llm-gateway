@@ -213,28 +213,89 @@ local function get_opt_config(opt_str)
     return result
 end
 
--- 将 Anthropic 格式的 content 数组转为 OpenAI 字符串格式
--- content: [{type:"text", text:"xxx"}, ...] -> content: "xxx"
--- content: [{type:"text", text:"a"}, {type:"text", text:"b"}] -> content: "a\nb"
--- content: "string" -> content: "string"
-local function normalize_content(content)
+local function extract_tool_result_content(content)
     if type(content) == "string" then
         return content
     end
-    if type(content) == "table" then
-        local parts = {}
-        for i, item in ipairs(content) do
-            if type(item) == "string" then
-                table.insert(parts, item)
-            elseif type(item) == "table" and item.text then
-                table.insert(parts, item.text)
-            end
-        end
-        if #parts > 0 then
-            return table.concat(parts, "\n")
+    if type(content) ~= "table" then
+        return ""
+    end
+
+    local parts = {}
+    for _, item in ipairs(content) do
+        if type(item) == "string" then
+            table.insert(parts, item)
+        elseif type(item) == "table" and item.text then
+            table.insert(parts, item.text)
         end
     end
-    return content
+    return table.concat(parts, "\n")
+end
+
+local function anthropic_content_to_openai(role, content, out_messages)
+    if type(content) == "string" then
+        return content, nil
+    end
+    if type(content) ~= "table" then
+        return "", nil
+    end
+
+    local text_parts = {}
+    local multipart = {}
+    local tool_calls = {}
+    local has_non_text_part = false
+
+    for _, block in ipairs(content) do
+        if type(block) == "string" then
+            table.insert(text_parts, block)
+            table.insert(multipart, { ["type"] = "text", text = block })
+        elseif type(block) == "table" then
+            local block_type = block.type
+            if block_type == "text" then
+                local t = block.text or ""
+                table.insert(text_parts, t)
+                table.insert(multipart, { ["type"] = "text", text = t })
+            elseif block_type == "image" and role == "user" then
+                has_non_text_part = true
+                local source = block.source or {}
+                local image_url = nil
+                if source.type == "base64" and source.data then
+                    local media_type = source.media_type or "image/jpeg"
+                    image_url = "data:" .. media_type .. ";base64," .. source.data
+                elseif source.type == "url" and source.url then
+                    image_url = source.url
+                end
+                if image_url then
+                    table.insert(multipart, {
+                        ["type"] = "image_url",
+                        image_url = { url = image_url }
+                    })
+                end
+            elseif block_type == "tool_use" and role == "assistant" then
+                local args = block.input or {}
+                local args_json = json_encode(args)
+                table.insert(tool_calls, {
+                    id = block.id or "",
+                    ["type"] = "function",
+                    ["function"] = {
+                        name = block.name or "",
+                        arguments = args_json
+                    }
+                })
+            elseif block_type == "tool_result" and role == "user" then
+                table.insert(out_messages, {
+                    role = "tool",
+                    tool_call_id = block.tool_use_id or "",
+                    content = extract_tool_result_content(block.content)
+                })
+            end
+        end
+    end
+
+    if has_non_text_part then
+        return multipart, tool_calls
+    end
+    return table.concat(text_parts, "\n"), tool_calls
 end
 
 -- 重建请求体
@@ -247,45 +308,74 @@ local function rebuild_request_body(original_body, model, opt_config, provider_s
 
     -- 创建新请求体
     local new_body = {}
+    local messages = {}
 
     -- 兼容 Anthropic 格式: messages 或 prompt
     if orig.messages then
-        local normalized_msgs = {}
-        for i, msg in ipairs(orig.messages) do
-            local new_msg = {}
-            new_msg.role = msg.role
-            new_msg.content = normalize_content(msg.content)
-            if msg.name then
-                new_msg.name = msg.name
+        for _, msg in ipairs(orig.messages) do
+            local role = msg.role or "user"
+            local content = msg.content
+            local openai_content, tool_calls = anthropic_content_to_openai(role, content, messages)
+            local only_tool_result = false
+            if role == "user" and type(content) == "table" then
+                only_tool_result = true
+                for _, block in ipairs(content) do
+                    if type(block) ~= "table" or block.type ~= "tool_result" then
+                        only_tool_result = false
+                        break
+                    end
+                end
             end
-            table.insert(normalized_msgs, new_msg)
+
+            if role ~= "tool" and not only_tool_result then
+                local new_msg = {
+                    role = role,
+                    content = openai_content
+                }
+                if role == "assistant" and tool_calls and #tool_calls > 0 then
+                    new_msg.tool_calls = tool_calls
+                    if type(openai_content) == "string" and openai_content == "" then
+                        new_msg.content = nil
+                    end
+                end
+                if msg.name then
+                    new_msg.name = msg.name
+                end
+                table.insert(messages, new_msg)
+            end
         end
-        new_body.messages = normalized_msgs
     elseif orig.prompt then
         local prompt = orig.prompt
         if type(prompt) == "string" then
-            new_body.messages = {{role = "user", content = prompt}}
+            table.insert(messages, { role = "user", content = prompt })
         elseif type(prompt) == "table" then
-            local msgs = {}
-            for i, p in ipairs(prompt) do
-                table.insert(msgs, {role = "user", content = p})
+            for _, p in ipairs(prompt) do
+                table.insert(messages, { role = "user", content = p })
             end
-            new_body.messages = msgs
         end
     end
 
-    if not new_body.messages and orig.content then
-        new_body.messages = {{role = "user", content = orig.content}}
+    if #messages == 0 and orig.content then
+        table.insert(messages, { role = "user", content = orig.content })
     end
+
+    new_body.messages = messages
 
     -- 设置模型
     new_body.model = model
 
     -- 透传通用参数
-    for _, field in ipairs({"max_tokens", "temperature", "top_p", "top_k", "stop", "presence_penalty", "frequency_penalty", "seed", "logprobs"}) do
+    for _, field in ipairs({"max_tokens", "temperature", "top_p", "presence_penalty", "frequency_penalty", "seed", "logprobs"}) do
         if orig[field] ~= nil then
             new_body[field] = orig[field]
         end
+    end
+
+    -- Anthropic stop_sequences -> OpenAI stop
+    if orig.stop_sequences ~= nil then
+        new_body.stop = orig.stop_sequences
+    elseif orig.stop ~= nil then
+        new_body.stop = orig.stop
     end
 
     -- 透传 system 消息 (Anthropic: system 字符串/数组 → OpenAI: system role message)
@@ -332,8 +422,14 @@ local function rebuild_request_body(original_body, model, opt_config, provider_s
             elseif orig.tool_choice == "any" then
                 new_body.tool_choice = "required"
             end
-        elseif type(orig.tool_choice) == "table" and orig.tool_choice.name then
-            new_body.tool_choice = {["type"] = "function", ["function"] = {name = orig.tool_choice.name}}
+        elseif type(orig.tool_choice) == "table" then
+            if orig.tool_choice.type == "auto" then
+                new_body.tool_choice = "auto"
+            elseif orig.tool_choice.type == "tool" and orig.tool_choice.name then
+                new_body.tool_choice = {["type"] = "function", ["function"] = {name = orig.tool_choice.name}}
+            elseif orig.tool_choice.name then
+                new_body.tool_choice = {["type"] = "function", ["function"] = {name = orig.tool_choice.name}}
+            end
         end
     end
 
@@ -343,7 +439,9 @@ local function rebuild_request_body(original_body, model, opt_config, provider_s
     -- 应用 opt 配置 (覆盖上面透传的参数)
     for field, value in pairs(opt_config) do
         local num = tonumber(value)
-        if num then
+        if field == "stream" then
+            -- stream 由 Rust 统一注入，不由 Lua 决定
+        elseif num then
             new_body[field] = num
         elseif value == "true" then
             new_body[field] = true

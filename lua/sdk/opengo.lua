@@ -36,8 +36,7 @@ function opengo.get_extra_headers(api_key)
 end
 
 -- 转换请求
--- 1. 规范化 model ID（已有前缀则保留，否则保持原样）
--- 2. 将 Anthropic 格式的 content 数组转为 OpenAI 字符串
+-- 仅规范化 model，其他字段保持传入结构，避免破坏多模态/tool_calls
 function opengo.transform_request(body_str, model, config)
     if not body_str or body_str == "" then
         return '{"model":"' .. normalize_model(model) .. '","messages":[]}'
@@ -50,25 +49,6 @@ function opengo.transform_request(body_str, model, config)
 
     -- 规范化 model
     body.model = normalize_model(model)
-
-    -- 将 Anthropic 格式 content 数组转为字符串
-    if body.messages then
-        for i, msg in ipairs(body.messages) do
-            if type(msg.content) == "table" then
-                local parts = {}
-                for j, item in ipairs(msg.content) do
-                    if type(item) == "string" then
-                        table.insert(parts, item)
-                    elseif type(item) == "table" and item.text then
-                        table.insert(parts, item.text)
-                    end
-                end
-                if #parts > 0 then
-                    msg.content = table.concat(parts, "\n")
-                end
-            end
-        end
-    end
 
     return json_encode(body)
 end
