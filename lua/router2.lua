@@ -300,16 +300,24 @@ local function anthropic_content_to_openai(role, content, out_messages)
 end
 
 --- 判断 provider 是否需要 Anthropic→OpenAI 格式转换
--- provider 名称包含 "anthropic" → 不需要转换，直接透传
+-- provider 名称或 baseurl 包含 "anthropic" → 不需要转换，直接透传
 -- @param provider_key string provider 名称 (如 "opengo", "anthropic")
+-- @param baseurl string provider 的 baseurl
 -- @return boolean true=需要转换, false=不需要转换
-local function needs_format_conversion(provider_key)
-    if not provider_key then
-        return true  -- 默认需要转换
+local function needs_format_conversion(provider_key, baseurl)
+    -- 检查 provider 名称
+    if provider_key then
+        local lower_key = string.lower(provider_key)
+        if string.find(lower_key, "anthropic") then
+            return false  -- Anthropic provider 不需要转换
+        end
     end
-    local lower_key = string.lower(provider_key)
-    if string.find(lower_key, "anthropic") then
-        return false  -- Anthropic provider 不需要转换
+    -- 检查 baseurl
+    if baseurl then
+        local lower_url = string.lower(baseurl)
+        if string.find(lower_url, "anthropic") then
+            return false  -- baseurl 含 anthropic，不需要转换
+        end
     end
     return true  -- 其他 provider 需要转换为 OpenAI 格式
 end
@@ -351,7 +359,7 @@ local function rebuild_request_body(original_body, model, opt_config, provider_s
     end
 
     -- ★ Anthropic provider 直通：不做格式转换，只替换模型名和应用 opt
-    if not needs_format_conversion(provider_key) then
+    if not needs_format_conversion(provider_key, provider_cfg.baseurl) then
         local request_format = detect_request_format(original_body)
         pcall(redis_set, "code:debug_format",
             string.format("skip_conversion:provider=%s req_format=%s", provider_key, request_format))
@@ -621,22 +629,42 @@ function handler.on_request(method, path, headers, body)
         }
     end
 
-    -- 获取 SDK 端点 (只是路径前缀，如 /zen/go)
+    -- 获取端点路径
+    -- Anthropic provider: /v1/messages
+    -- OpenAI 兼容 provider: /v1/chat/completions (或 SDK 定义)
     local endpoint = "/v1/chat/completions"
-    if provider_sdk and provider_sdk.get_endpoint then
+    if string.find(string.lower(provider_cfg.baseurl), "anthropic") then
+        endpoint = "/v1/messages"
+    elseif provider_sdk and provider_sdk.get_endpoint then
         endpoint = provider_sdk.get_endpoint(provider_cfg.baseurl)
     end
 
-    -- 提取 host (移除协议，保留路径前缀)
-    -- baseurl = https://opencode.ai/zen/go/v1/chat/completions
-    -- host = opencode.ai/zen/go
-    local host = provider_cfg.baseurl:gsub("^https?://", "")
-    host = host:gsub("/v1/chat/completions.*", "")
-    if host == "" then host = provider_cfg.baseurl:gsub("^https?://", "") end
-    local use_tls = string.sub(provider_cfg.baseurl, 1, 5) == "https"
+    -- 提取 host 和 rewrite_path
+    -- 统一逻辑：从 baseurl 分离 host 和 path，再拼接 endpoint
+    local baseurl = provider_cfg.baseurl
+    local use_tls = string.sub(baseurl, 1, 5) == "https"
 
-    -- 完整 URL = host + /v1/chat/completions
-    local rewrite_path = "/v1/chat/completions"
+    -- 去掉协议前缀
+    local url_body = baseurl:gsub("^https?://", "")
+
+    -- 分离 host 和 path
+    -- url_body: "qianfan.baidubce.com/anthropic/coding" 或 "api.openai.com"
+    local host, path_prefix = url_body:match("^([^/]+)(.*)")
+    if not host then
+        host = url_body  -- 无路径的情况
+        path_prefix = ""
+    end
+
+    -- ★ 对于 Anthropic provider，endpoint 已经是完整路径
+    -- rewrite_path = path_prefix + endpoint
+    -- 例: /anthropic/coding + /v1/messages = /anthropic/coding/v1/messages
+    local rewrite_path = path_prefix .. endpoint
+
+    -- DEBUG: 保存路由信息
+    pcall(redis_set, "code:debug_route", string.format(
+        "host=%s|endpoint=%s|path_prefix=%s|rewrite_path=%s",
+        host, endpoint, path_prefix, rewrite_path
+    ))
 
     -- 统计：调用次数
     local count_key = "code:" .. selected .. ":calls"
@@ -657,7 +685,7 @@ function handler.on_request(method, path, headers, body)
     save_translated_request(new_body, selected, code_cfg.provider, code_cfg.model)
 
     -- ★ 是否需要格式转换 (Anthropic provider 不需要)
-    local need_transform = needs_format_conversion(code_cfg.provider)
+    local need_transform = needs_format_conversion(code_cfg.provider, provider_cfg.baseurl)
 
     -- 返回代理决策
     return {
