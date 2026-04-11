@@ -7,11 +7,17 @@
 //! Lua 职责：Redis 配置读取、URL 重写、Token 统计
 
 mod anthropic_convert;
+mod sse_stream;
 use anthropic_convert::{
     extract_error_message, extract_openai_fields, transform_anthropic_request_to_openai,
-    transform_openai_to_anthropic, wrap_as_sse, convert_openai_content_to_anthropic,
+    transform_openai_to_anthropic, convert_openai_content_to_anthropic,
     convert_openai_tool_calls_to_anthropic, decompress_field, assemble_anthropic_response,
     anthropic_error_response,
+};
+use sse_stream::{
+    new_sse_stream_state, transform_openai_sse_chunk_to_anthropic,
+    generate_stream_end_events, generate_error_sse_stream, SseLineParser, inject_stream_true,
+    sse_register, sse_update_openai_id, sse_unregister, sse_active_count,
 };
 
 use async_trait::async_trait;
@@ -837,6 +843,28 @@ fn generate_running_html() -> String {
         ));
     }
 
+    // SSE 连接状态
+    let sse_connections = sse_stream::sse_get_active_connections();
+    let sse_count = sse_connections.len();
+    let mut sse_rows = String::new();
+    for conn in &sse_connections {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64 - conn.created_at;
+        sse_rows.push_str(&format!(
+            "<tr><td>#{}<td>{}</td><td style=\"font-size:0.8em\">{}</td><td>{}</td><td>{}ms</td></tr>",
+            conn.id,
+            if conn.client_request_id.is_empty() { "-" } else { &conn.client_request_id },
+            if conn.openai_sse_id.is_empty() { "pending..." } else { &conn.openai_sse_id },
+            conn.model,
+            elapsed,
+        ));
+    }
+    if sse_rows.is_empty() {
+        sse_rows = "<tr><td colspan=\"5\" style=\"color:#999;text-align:center\">无活跃连接</td></tr>".to_string();
+    }
+
     format!(r#"<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>LLM Gateway</title>
 <style>body{{font-family:sans-serif;max-width:900px;margin:40px auto;padding:20px;background:#f5f5f5}}h1{{color:#333;border-bottom:2px solid #4CAF50;padding-bottom:10px}}h2{{color:#555;margin-top:25px}}.card{{background:white;border-radius:8px;padding:20px;margin:15px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:10px;border-bottom:1px solid #eee}}th{{background:#f9f9f9}}.stat-box{{display:inline-block;background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:12px 20px;border-radius:8px;margin:5px;text-align:center}}.stat-box .v{{font-size:1.4em;font-weight:bold}}.stat-box .l{{font-size:0.75em;opacity:0.9}}.stat-box.green{{background:linear-gradient(135deg,#11998e,#38ef7d)}}.stat-box.orange{{background:linear-gradient(135deg,#f093fb,#f5576c)}}.num{{font-family:monospace;background:#e3f2fd;padding:2px 6px;border-radius:4px}}.provider{{color:#1976d2;font-weight:500}}.selected{{background:#fff3e0}}.prompt{{color:#4CAF50}}.completion{{color:#2196F3}}</style>
@@ -848,8 +876,11 @@ fn generate_running_html() -> String {
 <div class="card"><h2>模型统计</h2><table>
 <tr><th>编号</th><th>提供商</th><th>模型</th><th>调用</th><th class="prompt">Prompt</th><th class="completion">Completion</th><th>最近</th></tr>
 {}</table></div>
-<p style="color:#999;text-align:center;margin-top:20px">LLM Gateway | <a href="/debug">debug</a> | <a href="/config">config</a> | <a href="/raw">raw</a></p>
-</body></html>"#, total_calls, total_prompt, total_completion, total_tokens, model_rows)
+<div class="card"><h2>SSE 流连接 <span style="font-size:0.8em;color:#888\">({} active)</span></h2><table>
+<tr><th>ID</th><th>Client ID</th><th>OpenAI SSE ID</th><th>Model</th><th>Elapsed</th></tr>
+{}</table></div>
+<p style="color:#999;text-align:center;margin-top:20px">LLM Gateway | <a href="/debug">debug</a> | <a href="/config">config</a> | <a href="/raw">raw</a> | <a href="/sse">sse json</a></p>
+</body></html>"#, total_calls, total_prompt, total_completion, total_tokens, model_rows, sse_count, sse_rows)
 }
 
 #[derive(Clone, Default, Debug)]
@@ -925,6 +956,28 @@ impl ProxyHttp for LuaGateway {
             return Ok(true);
         }
 
+        // /sse 端点：查看 SSE 连接状态
+        if path == "/sse" {
+            let connections = sse_stream::sse_get_active_connections();
+            let conn_json: Vec<serde_json::Value> = connections.iter().map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "client_request_id": c.client_request_id,
+                    "openai_sse_id": c.openai_sse_id,
+                    "model": c.model,
+                    "created_at": c.created_at,
+                    "finished_at": c.finished_at,
+                })
+            }).collect();
+            let json = serde_json::json!({
+                "active_count": sse_stream::sse_active_count(),
+                "connections": conn_json,
+            });
+            let body = serde_json::to_string_pretty(&json).unwrap_or_default();
+            session.respond_error_with_body(200, Bytes::from(body)).await?;
+            return Ok(true);
+        }
+
         // 读取请求体 (POST/PUT 等方法) - 循环读取完整 body
         let body = if method == "POST" || method == "PUT" || method == "PATCH" {
             let mut full_body = Vec::new();
@@ -959,12 +1012,10 @@ impl ProxyHttp for LuaGateway {
                 session.respond_error_with_body(decision.status, body).await?;
                 return Ok(true);
             }
-            "proxy" => {
+"proxy" => {
                 info!("[port:{}] Action: proxy, upstream: {}, addr: {}", self.port, decision.upstream, decision.addr);
-                // 使用 reqwest 直接代理请求
                 ctx.decision = decision.clone();
 
-                // 构建上游 URL
                 let upstream_url = if decision.tls {
                     format!("https://{}{}", decision.addr, decision.rewrite_path)
                 } else {
@@ -973,24 +1024,37 @@ impl ProxyHttp for LuaGateway {
 
                 info!("Proxying to: {} (tls={})", upstream_url, decision.tls);
 
-                // 使用 reqwest 发送请求
-                let client = reqwest::Client::builder()
-                    .danger_accept_invalid_certs(!*SKIP_TLS_VERIFY || !decision.tls)
-                    .build()
-                    .map_err(|e| Error::explain(ErrorType::InternalError, format!("create client: {}", e)))?;
+                // 解析原始请求参数
+                let stream_requested = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
+                    .ok()
+                    .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+                    .unwrap_or(false);
 
-let request_body = if !decision.new_request_body.is_empty() {
-                    // Lua 层转换结果（小请求体）
-                    decision.new_request_body.clone()
+                let original_model = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
+                    .ok()
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()));
+
+                // 构建请求体：9089 端口需要转换 Anthropic → OpenAI，流式时注入 stream:true
+                let request_body = if !decision.new_request_body.is_empty() {
+                    if self.port == 9089 && stream_requested {
+                        match inject_stream_true(&decision.new_request_body) {
+                            Some(body) => body,
+                            None => decision.new_request_body.clone(),
+                        }
+                    } else {
+                        decision.new_request_body.clone()
+                    }
                 } else if self.port == 9089 && body.len() > 2048 {
-                    // 大请求体直接在 Rust 层转换，绕过 Lua JSON 编解码瓶颈
                     let model = decision.model.clone();
                     match transform_anthropic_request_to_openai(
                         &String::from_utf8_lossy(&body), &model
                     ) {
                         Some(converted) => {
-                            info!("Rust-level Anthropic→OpenAI conversion ({} bytes)", converted.len());
-                            converted
+                            if stream_requested {
+                                inject_stream_true(&converted).unwrap_or(converted)
+                            } else {
+                                converted
+                            }
                         }
                         None => {
                             warn!("Rust-level Anthropic→OpenAI conversion failed, using raw body");
@@ -1001,6 +1065,11 @@ let request_body = if !decision.new_request_body.is_empty() {
                     String::from_utf8_lossy(&body).to_string()
                 };
 
+                let client = reqwest::Client::builder()
+                    .danger_accept_invalid_certs(!*SKIP_TLS_VERIFY || !decision.tls)
+                    .build()
+                    .map_err(|e| Error::explain(ErrorType::InternalError, format!("create client: {}", e)))?;
+
                 let mut req = client.post(&upstream_url)
                     .header("Content-Type", "application/json")
                     .body(request_body);
@@ -1009,10 +1078,136 @@ let request_body = if !decision.new_request_body.is_empty() {
                     req = req.header("Authorization", format!("Bearer {}", decision.api_key));
                 }
 
-                // Extract hostname only for Host header (strip path from addr like "opencode.ai/zen/go")
                 let host_only = decision.addr.split('/').next().unwrap_or(&decision.addr);
                 req = req.header("Host", host_only);
 
+                // ============================================================
+                // 9089 端口 + 流式请求：真流式转换路径
+                // ============================================================
+                if self.port == 9089 && stream_requested {
+                    // 注册 SSE 连接
+                    let client_req_id = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
+                        .ok()
+                        .and_then(|v| {
+                            // Anthropic 客户端可能发送 id，用于追踪
+                            v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string())
+                        })
+                        .unwrap_or_default();
+                    let conn_id = sse_register(
+                        client_req_id,
+                        String::new(), // openai_sse_id 在首个 chunk 时更新
+                        original_model.as_deref().unwrap_or("unknown").to_string(),
+                    );
+
+                    let response = req.send().await
+                        .map_err(|e| {
+                            sse_unregister(conn_id);
+                            Error::explain(ErrorType::InternalError, format!("upstream error: {}", e))
+                        })?;
+
+                    let status = response.status();
+
+                    if !status.is_success() {
+                        // 上游错误：包装为 Anthropic 错误 SSE 流
+                        let error_body = response.text().await.unwrap_or_default();
+                        let model_str = original_model.as_deref().unwrap_or("unknown");
+                        let error_msg = extract_error_message(&error_body);
+                        info!("[SSE-REG#{}] Upstream error for streaming request: status={}, msg={}", conn_id, status, &error_msg[..error_msg.len().min(200)]);
+                        let error_sse = generate_error_sse_stream(&error_msg, model_str);
+
+                        let mut resp = ResponseHeader::build(200, None)?;
+                        resp.insert_header("Content-Type", "text/event-stream")?;
+                        resp.insert_header("Cache-Control", "no-cache")?;
+                        resp.insert_header("Connection", "keep-alive")?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session.write_response_body(Some(Bytes::from(error_sse)), true).await?;
+
+                        ctx.response_status = status.as_u16();
+                        if let Ok(lua) = self.lua.read() {
+                            lua.call_on_response(&decision.upstream, status.as_u16(), error_body.as_bytes());
+                        }
+                        sse_unregister(conn_id);
+                        return Ok(true);
+                    }
+
+                    // 上游成功，开始真流式转换
+                    info!("[SSE-REG#{}] Starting SSE stream transformation (model={}, active={})", conn_id, original_model.as_deref().unwrap_or("unknown"), sse_active_count());
+
+                    let mut resp = ResponseHeader::build(200, None)?;
+                    resp.insert_header("Content-Type", "text/event-stream")?;
+                    resp.insert_header("Cache-Control", "no-cache")?;
+                    resp.insert_header("Connection", "keep-alive")?;
+                    session.write_response_header(Box::new(resp), false).await?;
+
+                    let mut state = new_sse_stream_state(original_model.unwrap_or_default());
+                    let mut sse_parser = SseLineParser::new();
+                    let mut stream_done = false;
+
+                    let mut stream_response = response;
+                    while let Some(chunk) = stream_response.chunk().await.map_err(|e| {
+                        sse_unregister(conn_id);
+                        Error::explain(ErrorType::InternalError, format!("chunk read error: {}", e))
+                    })? {
+                        sse_parser.push_data(&chunk);
+
+                        let lines = sse_parser.extract_lines();
+                        for line in lines {
+                            if line == "[DONE]" {
+                                // 流结束，确保发送结束事件
+                                if !stream_done {
+                                    stream_done = true;
+                                    if state.started && !state.msg_id.is_empty() {
+                                        // 如果已经开始了但没收到 finish_reason，补发结束事件
+                                        if !state.in_content_block && state.content_block_index > 0 {
+                                            let end_events = generate_stream_end_events(&mut state, "end_turn", 0);
+                                            for event in end_events {
+                                                session.write_response_body(Some(Bytes::from(event)), false).await?;
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
+                            let events = transform_openai_sse_chunk_to_anthropic(&line, &mut state);
+                            // 首个 chunk 时更新连接的 openai_sse_id
+                            if !state.msg_id.is_empty() {
+                                sse_update_openai_id(conn_id, &state.msg_id);
+                            }
+                            for event in events {
+                                if let Err(e) = session.write_response_body(Some(Bytes::from(event)), false).await {
+                                    warn!("[SSE-REG#{}] Failed to write SSE event to client: {}", conn_id, e);
+                                }
+                            }
+                        }
+                    }
+
+                    // 流结束安全保障：如果消息已开始但未正常结束，补发结束事件
+                    if state.started && !stream_done {
+                        if state.in_content_block || state.content_block_index > 0 {
+                            let end_events = generate_stream_end_events(&mut state, "end_turn", 0);
+                            for event in end_events {
+                                let _ = session.write_response_body(Some(Bytes::from(event)), false).await;
+                            }
+                        }
+                    }
+
+                    // 关闭响应流
+                    session.write_response_body(None, true).await?;
+
+                    info!("[SSE-REG#{}] SSE stream transformation completed (openai_id={})", conn_id, state.msg_id);
+
+                    ctx.response_status = 200;
+                    if let Ok(lua) = self.lua.read() {
+                        lua.call_on_response(&decision.upstream, 200, b"streaming response");
+                    }
+                    sse_unregister(conn_id);
+                    return Ok(true);
+                }
+
+                // ============================================================
+                // 非流式路径：完整读取响应后转换
+                // ============================================================
                 let response = req.send().await
                     .map_err(|e| Error::explain(ErrorType::InternalError, format!("upstream error: {}", e)))?;
 
@@ -1022,24 +1217,11 @@ let request_body = if !decision.new_request_body.is_empty() {
 
                 info!("Upstream response: status={}", status);
 
-                // 9089 端口：分层处理 OpenAI → Anthropic 响应转换
-                // Rust 提取字段 → Lua 做简单映射 → Rust 解压+组装
-                let stream_requested = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
-                    .ok()
-                    .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
-                    .unwrap_or(false);
-
-                let original_model = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
-                    .ok()
-                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()));
-
                 let final_response_body = if self.port == 9089 {
                     let lua = self.lua.read().unwrap();
 
-                    // Step 1: Rust 提取 OpenAI 响应字段，压缩大字段
                     match extract_openai_fields(&response_body) {
                         Some(fields) => {
-                            // Step 2: 调用 Lua 做简单字段映射
                             let lua_result = lua.call_on_transform_response(
                                 &fields.id,
                                 &fields.model,
@@ -1052,10 +1234,8 @@ let request_body = if !decision.new_request_body.is_empty() {
 
                             match lua_result {
                                 Some(lr) => {
-                                    // Step 3: Rust 解压 content/tool_calls，做结构转换，组装响应
                                     let mut content_blocks = Vec::new();
 
-                                    // 解压并转换 content
                                     if let Some(ref comp_content) = lr.compressed_content {
                                         if let Some(content_val) = decompress_field(comp_content) {
                                             let text = content_val.as_str().unwrap_or("");
@@ -1065,7 +1245,6 @@ let request_body = if !decision.new_request_body.is_empty() {
                                         }
                                     }
 
-                                    // 解压并转换 tool_calls
                                     if let Some(ref comp_tc) = lr.compressed_tool_calls {
                                         if let Some(tc_val) = decompress_field(comp_tc) {
                                             if let Some(tc_arr) = tc_val.as_array() {
@@ -1075,7 +1254,6 @@ let request_body = if !decision.new_request_body.is_empty() {
                                         }
                                     }
 
-                                    // fallback
                                     if content_blocks.is_empty() {
                                         content_blocks.push(serde_json::json!({"type": "text", "text": ""}));
                                     }
@@ -1089,25 +1267,13 @@ let request_body = if !decision.new_request_body.is_empty() {
                                         content_blocks,
                                     );
 
-                                    if stream_requested {
-                                        info!("Wrapping Anthropic response as SSE stream (via Lua+Rust pipeline)");
-                                        wrap_as_sse(&anthropic_json)
-                                    } else {
-                                        info!("Transformed OpenAI response to Anthropic format (via Lua+Rust pipeline)");
-                                        anthropic_json
-                                    }
+                                    info!("Transformed OpenAI response to Anthropic format (via Lua+Rust pipeline)");
+                                    anthropic_json
                                 }
                                 None => {
-                                    // Lua 回调失败，降级到 Rust 直接转换
                                     info!("Lua on_transform_response failed, falling back to direct transform");
                                     match transform_openai_to_anthropic(&response_body, original_model.as_deref()) {
-                                        Some(converted) => {
-                                            if stream_requested {
-                                                wrap_as_sse(&converted)
-                                            } else {
-                                                converted
-                                            }
-                                        }
+                                        Some(converted) => converted,
                                         None => {
                                             let model_str = original_model.as_deref().unwrap_or("");
                                             let error_msg = extract_error_message(&response_body);
@@ -1119,7 +1285,6 @@ let request_body = if !decision.new_request_body.is_empty() {
                             }
                         }
                         None => {
-                            // 非 OpenAI 格式响应（上游错误），包装为 Anthropic 错误格式
                             let model_str = original_model.as_deref().unwrap_or("");
                             let error_msg = extract_error_message(&response_body);
                             info!("Upstream non-OpenAI response, wrapping as Anthropic error: {}", error_msg);
@@ -1130,22 +1295,11 @@ let request_body = if !decision.new_request_body.is_empty() {
                     response_body.clone()
                 };
 
-                // 返回响应 (先克隆用于回调)
                 let resp_body = Bytes::from(final_response_body.clone());
-                if stream_requested && self.port == 9089 {
-                    let mut resp = ResponseHeader::build(200, None)?;
-                    resp.insert_header("Content-Type", "text/event-stream")?;
-                    resp.insert_header("Cache-Control", "no-cache")?;
-                    resp.insert_header("Connection", "keep-alive")?;
-                    session.write_response_header(Box::new(resp), false).await?;
-                    session.write_response_body(Some(resp_body), true).await?;
-                } else {
-                    session.respond_error_with_body(status.as_u16(), resp_body).await?;
-                }
+                session.respond_error_with_body(status.as_u16(), resp_body).await?;
 
                 ctx.response_status = status.as_u16();
 
-                // 调用 Lua 回调
                 info!("[port:{}] Calling on_response callback with upstream: {}", 
                     self.port, decision.upstream);
                 if let Ok(lua) = self.lua.read() {
