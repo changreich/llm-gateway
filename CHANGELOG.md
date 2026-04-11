@@ -1,5 +1,36 @@
 # Changelog
 
+## [2026-04-11] v0.1.2 - Anthropic 完整支持 + 端口分离
+
+### 新增
+
+- **端口 9089 独立路由**: 新增 router2.lua，支持独立的路由逻辑
+- **Anthropic 格式完整支持**: SSE 流式响应 + 请求体转换 + 响应格式修正
+- **真 SSE 流式转换**: 9089 端口逐 chunk 转换 + 连接注册表管理
+- **请求保存功能**: router2.lua 支持保存最近 5 个请求到 Redis (`raw` key)
+- **config2.lua 初始化**: router2.lua 支持从 config2.lua 加载独立配置
+- **自定义 Redis 连接池**: 实现自定义连接池，复用 Redis 连接
+
+### 变更
+
+- 使用 flate2 解压 + 拆分 Anthropic 压缩响应
+- Lua 主导字段改写 + Rust SSE 处理 + code:select 识别
+
+### 修复
+
+- router2.lua 5 个关键 bug 修复
+- 使用 r2d2 连接池复用 Redis 连接，避免 TIME_WAIT 爆炸
+
+### 架构变化
+
+```
+之前: 单端口统一路由
+现在: 9090端口 -> router.lua (通用)
+     9089端口 -> router2.lua (Anthropic专用)
+```
+
+---
+
 ## [2026-04-05] TLS 与请求体重写优化
 
 ### 新增
