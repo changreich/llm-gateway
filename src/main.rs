@@ -241,9 +241,18 @@ impl LuaRuntime {
         let json_decode_fn = lua.create_function(|lua, s: String| {
             let v: serde_json::Value = serde_json::from_str(&s)
                 .map_err(|e| mlua::Error::external(format!("json decode: {}", e)))?;
-            json_to_lua(&lua, &v)
+            json_to_lua_deep(&lua, &v)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create json_decode: {}", e)))?;
         globals.set("json_decode", json_decode_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set json_decode: {}", e)))?;
+
+        // json_encode(table) -> string
+        let json_encode_fn = lua.create_function(|_lua, val: mlua::Value| {
+            let json_val = lua_to_json(&val);
+            let s = serde_json::to_string(&json_val)
+                .map_err(|e| mlua::Error::external(format!("json encode: {}", e)))?;
+            Ok(s)
+        }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create json_encode: {}", e)))?;
+        globals.set("json_encode", json_encode_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set json_encode: {}", e)))?;
 
         // redis_expire(key, seconds) -> bool
         let redis_expire_fn = lua.create_function(|_lua, (key, seconds): (String, i64)| {
@@ -592,13 +601,25 @@ impl LuaRuntime {
             model: result.get("model").unwrap_or_default(),
             rewrite_path: result.get("rewrite_path").unwrap_or_default(),
             response_body: result.get("body").unwrap_or_default(),
-            new_request_body: result.get("new_body").unwrap_or_default(),
+            new_request_body: result.get("new_request_body").unwrap_or_default(),
         })
     }
 
     fn call_on_response(&self, upstream: &str, status: u16, body: &[u8]) {
+        info!("call_on_response called: upstream={}, status={}", upstream, status);
         if let Ok(handler) = self.lua.globals().get::<Table>("handler") {
-            let _ = handler.call_method::<()>("on_response", (upstream, status, body));
+            match handler.get::<mlua::Function>("on_response") {
+                Ok(on_response) => {
+                    let body_str = String::from_utf8_lossy(body).to_string();
+                    match on_response.call::<()>((upstream, status, body_str)) {
+                        Ok(_) => info!("on_response completed successfully"),
+                        Err(e) => error!("on_response call failed: {}", e),
+                    }
+                }
+                Err(e) => error!("on_response function not found: {}", e),
+            }
+        } else {
+            error!("handler table not found");
         }
     }
 
@@ -609,26 +630,115 @@ impl LuaRuntime {
     }
 }
 
-/// JSON Value 转 Lua Table
-fn json_to_lua(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
-    if let serde_json::Value::Object(map) = v {
-        for (k, v) in map {
-            match v {
-                serde_json::Value::String(s) => table.set(k.clone(), s.clone())?,
-                serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() {
-                        table.set(k.clone(), i)?;
-                    } else if let Some(f) = n.as_f64() {
-                        table.set(k.clone(), f)?;
+/// JSON Value 转 Lua Table (深度递归版，支持嵌套对象和数组)
+fn json_to_lua_deep(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Table> {
+    match v {
+        serde_json::Value::Object(map) => {
+            let table = lua.create_table()?;
+            for (k, val) in map {
+                match val {
+                    serde_json::Value::String(s) => table.set(k.clone(), s.clone())?,
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            table.set(k.clone(), i)?;
+                        } else if let Some(f) = n.as_f64() {
+                            table.set(k.clone(), f)?;
+                        }
                     }
+                    serde_json::Value::Bool(b) => table.set(k.clone(), *b)?,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        let nested = json_to_lua_deep(lua, val)?;
+                        table.set(k.clone(), nested)?;
+                    }
+                    serde_json::Value::Null => { /* skip null */ }
                 }
-                serde_json::Value::Bool(b) => table.set(k.clone(), *b)?,
-                _ => {}
             }
+            Ok(table)
+        }
+        serde_json::Value::Array(arr) => {
+            let table = lua.create_table()?;
+            for (i, val) in arr.iter().enumerate() {
+                match val {
+                    serde_json::Value::String(s) => table.set(i + 1, s.clone())?,
+                    serde_json::Value::Number(n) => {
+                        if let Some(i_val) = n.as_i64() {
+                            table.set(i + 1, i_val)?;
+                        } else if let Some(f) = n.as_f64() {
+                            table.set(i + 1, f)?;
+                        }
+                    }
+                    serde_json::Value::Bool(b) => table.set(i + 1, *b)?,
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        let nested = json_to_lua_deep(lua, val)?;
+                        table.set(i + 1, nested)?;
+                    }
+                    serde_json::Value::Null => { /* skip null */ }
+                }
+            }
+            Ok(table)
+        }
+        _ => {
+            let table = lua.create_table()?;
+            Ok(table)
         }
     }
-    Ok(table)
+}
+
+/// Lua Value 转 JSON Value
+fn lua_to_json(val: &mlua::Value) -> serde_json::Value {
+    match val {
+        mlua::Value::Nil => serde_json::Value::Null,
+        mlua::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        mlua::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+        mlua::Value::Number(f) => {
+            if let Some(n) = serde_json::Number::from_f64(*f) {
+                serde_json::Value::Number(n)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        mlua::Value::String(s) => serde_json::Value::String(s.to_str().map(|v| v.to_string()).unwrap_or_default()),
+        mlua::Value::Table(t) => {
+            // 判断是数组还是对象：如果从1开始有连续整数key，优先当数组
+            let mut max_idx = 0i64;
+            let mut has_string_key = false;
+            for pair in t.pairs::<mlua::Value, mlua::Value>() {
+                if let Ok((k, _)) = pair {
+                    if let mlua::Value::Integer(i) = k {
+                        if i > max_idx { max_idx = i; }
+                    } else {
+                        has_string_key = true;
+                    }
+                }
+            }
+
+            if max_idx > 0 && !has_string_key {
+                // 数组
+                let mut arr = Vec::new();
+                for i in 1..=max_idx {
+                    if let Ok(v) = t.get::<mlua::Value>(i) {
+                        arr.push(lua_to_json(&v));
+                    }
+                }
+                serde_json::Value::Array(arr)
+            } else {
+                // 对象（也可能混合了数字和字符串key）
+                let mut map = serde_json::Map::new();
+                for pair in t.pairs::<mlua::Value, mlua::Value>() {
+                    if let Ok((k, v)) = pair {
+                        let key_str = match k {
+                            mlua::Value::String(s) => s.to_str().map(|v| v.to_string()).unwrap_or_default(),
+                            mlua::Value::Integer(i) => i.to_string(),
+                            _ => continue,
+                        };
+                        map.insert(key_str, lua_to_json(&v));
+                    }
+                }
+                serde_json::Value::Object(map)
+            }
+        }
+        _ => serde_json::Value::Null,
+    }
 }
 
 /// 生成 /running 页面 HTML（从 Rust 全局缓存读取，无阻塞）
@@ -712,11 +822,12 @@ impl Default for GatewayCtx {
 
 struct LuaGateway {
     lua: Arc<RwLock<LuaRuntime>>,
+    port: u16,
 }
 
 impl LuaGateway {
-    fn new(lua: Arc<RwLock<LuaRuntime>>) -> Self {
-        Self { lua }
+    fn new(lua: Arc<RwLock<LuaRuntime>>, port: u16) -> Self {
+        Self { lua, port }
     }
 }
 
@@ -769,11 +880,13 @@ impl ProxyHttp for LuaGateway {
 
         match decision.action.as_str() {
             "reject" => {
+                info!("[port:{}] Action: reject", self.port);
                 let body = Bytes::from(decision.response_body.clone());
                 session.respond_error_with_body(decision.status, body).await?;
                 return Ok(true);
             }
             "proxy" => {
+                info!("[port:{}] Action: proxy, upstream: {}, addr: {}", self.port, decision.upstream, decision.addr);
                 // 使用 reqwest 直接代理请求
                 ctx.decision = decision.clone();
 
@@ -818,15 +931,20 @@ impl ProxyHttp for LuaGateway {
 
                 info!("Upstream response: status={}", status);
 
-                // 返回响应
-                let resp_body = Bytes::from(response_body);
+                // 返回响应 (先克隆用于回调)
+                let resp_body = Bytes::from(response_body.clone());
                 session.respond_error_with_body(status.as_u16(), resp_body).await?;
 
                 ctx.response_status = status.as_u16();
 
                 // 调用 Lua 回调
+                info!("[port:{}] Calling on_response callback with upstream: {}", 
+                    self.port, decision.upstream);
                 if let Ok(lua) = self.lua.read() {
-                    lua.call_on_response(&decision.upstream, status.as_u16(), &[]);
+                    lua.call_on_response(&decision.upstream, status.as_u16(), response_body.as_bytes());
+                    info!("on_response callback completed");
+                } else {
+                    error!("Failed to get lua runtime");
                 }
 
                 return Ok(true);
@@ -1056,7 +1174,7 @@ fn main() {
 
     // 第二个 Lua 运行时 (端口 9089)
     let listen2 = std::env::var("LLM_LISTEN_2").unwrap_or_else(|_| "0.0.0.0:9089".to_string());
-    let script2 = std::env::var("LLM_SCRIPT_2").unwrap_or_else(|_| "lua/router2.lua".to_string());
+    let script2 = std::env::var("LLM_SCRIPT_2").unwrap_or_else(|_| "router2.lua".to_string());
     let script_path2 = if PathBuf::from(&script2).is_absolute() {
         PathBuf::from(&script2)
     } else {
@@ -1078,14 +1196,14 @@ fn main() {
     server.bootstrap();
 
     // 主服务 (端口 9090)
-    let gateway = LuaGateway::new(lua_runtime);
+    let gateway = LuaGateway::new(lua_runtime, 9090);
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, gateway);
     proxy_service.add_tcp(&listen);
     server.add_service(proxy_service);
     info!("Listening on {} (router.lua)", listen);
 
     // 第二服务 (端口 9089)
-    let gateway2 = LuaGateway::new(lua_runtime2);
+    let gateway2 = LuaGateway::new(lua_runtime2, 9089);
     let mut proxy_service2 = pingora_proxy::http_proxy_service(&server.configuration, gateway2);
     proxy_service2.add_tcp(&listen2);
     server.add_service(proxy_service2);

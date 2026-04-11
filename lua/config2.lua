@@ -17,19 +17,19 @@ return {
     -- Code 配置
     code = {
         ["01"] = {
-            provider = "zhipu",
-            model = "GLM-4-Flash",
+            provider = "opengo",
+            model = "glm-5.1",
             opt = ""  -- 无选项
         },
         ["02"] = {
-            provider = "siliconflow",
-            model = "Qwen/Qwen3.5-4B",
-            opt = "01"  -- 使用 opt:01 配置
+            provider = "openzen",
+            model = "mimo-v2-pro-free",
+            opt = ""  -- 无选项
         },
         ["03"] = {
-            provider = "zhipu",
-            model = "GLM-4-Flash",
-            opt = "01+02"  -- 使用 opt:01 和 opt:02
+            provider = "qfcode",
+            model = "qianfan-code-latest",
+            opt = ""  -- 使用 opt:01 和 opt:02
         }
     },
 

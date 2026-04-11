@@ -9,8 +9,16 @@
 
 handler = {}
 
+-- 全局状态（用于 on_response 回调中保存请求数据）
+request_id = 0
+current_request = nil
+
+-- 脚本初始化完成标记 (v6)
+pcall(redis_set, "ROUTER2_V6_LOADED", "YES_" .. os.date("%H:%M:%S"))
+
 -- 从 config2.lua 加载默认配置
-local config_file = loadfile("lua/config2.lua")
+local config_path = script_dir .. "/config2.lua"
+local config_file = loadfile(config_path)
 local default_config = config_file and config_file() or {}
 
 -- 加载 SDK 模块
@@ -20,8 +28,9 @@ local sdk = dofile(script_dir .. "/sdk/init.lua")
 local default_code = default_config.code or {}
 local default_opt = default_config.opt or {}
 
--- 临时保存请求信息 (用于 on_response 中保存 raw)
-local current_request = {}
+-- 标记脚本已加载 (v4)
+pcall(redis_set, "router2_init_check", os.date("%H:%M:%S") .. "_test")
+pcall(redis_set, "router2_init_v4", os.date("%Y-%m-%d %H:%M:%S"))
 
 -------------------------------------------------------------------------------
 -- 初始化：将 config2.lua 配置写入 Redis
@@ -29,8 +38,21 @@ local current_request = {}
 
 local function init_config_to_redis()
     local ok, initialized = pcall(redis_get, "code:initialized")
+    
+    -- 如果 initialized 存在且为 "1"，检查 code:select 是否存在
     if ok and initialized == "1" then
-        return
+        local select_exists = pcall(redis_get, "code:select")
+        if not select_exists or select_exists == "" then
+            -- code:select 不存在，强制重新初始化
+            pcall(redis_set, "code:initialized", "")
+        else
+            return
+        end
+    end
+
+    -- 先设置默认选中，确保 code:select 最早被创建
+    if default_config.selected then
+        pcall(redis_set, "code:select", default_config.selected)
     end
 
     -- 写入 code 配置
@@ -48,9 +70,18 @@ local function init_config_to_redis()
         end
     end
 
-    -- 设置默认选中
-    if default_config.selected then
-        pcall(redis_set, "code:select", default_config.selected)
+    -- 加载 config.lua 中的 providers 并写入 Redis
+    local config_lua_path = script_dir .. "/config.lua"
+    local config_lua_file = loadfile(config_lua_path)
+    if config_lua_file then
+        local config_lua = config_lua_file()
+        if config_lua and config_lua.providers then
+            for name, cfg in pairs(config_lua.providers) do
+                local key = "provider:" .. name
+                local value = (cfg.baseurl or "") .. "|" .. (cfg.apikey or "")
+                pcall(redis_set, key, value)
+            end
+        end
     end
 
     -- 标记已初始化
@@ -63,11 +94,38 @@ end
 
 -- 保存原始请求/响应到 Redis (保留最近5个)
 local function save_raw_request(request, status, response)
+    pcall(redis_set, "code:debug_save_raw", "start")
+    
     local timestamp = os.date("%Y-%m-%d %H:%M:%S")
     local entry = '{"time":"' .. timestamp .. '","status":' .. status ..
                   ',"request":' .. request .. ',"response":' .. response .. '}'
-    pcall(redis_lpush, "code:raw", entry)
+    
+    pcall(redis_set, "code:debug_save_raw", "entry_len:" .. tostring(#entry))
+    
+    local lpush_result = pcall(redis_lpush, "code:raw", entry)
+    pcall(redis_set, "code:debug_save_raw", "lpush_result:" .. tostring(lpush_result))
+    
     pcall(redis_ltrim, "code:raw", 0, 4)  -- 只保留最近5个
+    
+    pcall(redis_set, "code:debug_save_raw", "done")
+end
+
+-- 保存转换后的请求到 Redis (保留最近5个)
+local function save_translated_request(request, selected, provider, model)
+    pcall(redis_set, "code:debug_save2", "start:" .. tostring(#request))
+    
+    local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+    -- 记录请求长度和前100个字符用于调试
+    local debug_info = "len:" .. tostring(#request) .. " preview:" .. string.sub(request, 1, 100)
+    pcall(redis_set, "code:debug_save2_detail", debug_info)
+    
+    local entry = '{"time":"' .. timestamp .. '","select":"' .. selected ..
+                  '","provider":"' .. provider .. '","model":"' .. model ..
+                  '","request":' .. request .. '}'
+    pcall(redis_lpush, "code:raw2", entry)
+    pcall(redis_ltrim, "code:raw2", 0, 4)  -- 只保留最近5个
+    
+    pcall(redis_set, "code:debug_save2", "done")
 end
 
 -- 分割字符串
@@ -156,7 +214,7 @@ local function get_opt_config(opt_str)
 end
 
 -- 重建请求体
-local function rebuild_request_body(original_body, model, opt_config)
+local function rebuild_request_body(original_body, model, opt_config, provider_sdk, provider_cfg)
     -- 解析原请求体
     local ok, orig = pcall(json_decode, original_body)
     if not ok or type(orig) ~= "table" then
@@ -166,9 +224,26 @@ local function rebuild_request_body(original_body, model, opt_config)
     -- 创建新请求体
     local new_body = {}
 
-    -- 保留 messages
+    -- 兼容 Anthropic 格式: messages 或 prompt
     if orig.messages then
         new_body.messages = orig.messages
+    elseif orig.prompt then
+        -- Anthropic 旧格式: prompt 是字符串或数组，转为 messages
+        local prompt = orig.prompt
+        if type(prompt) == "string" then
+            new_body.messages = {{role = "user", content = prompt}}
+        elseif type(prompt) == "table" then
+            local msgs = {}
+            for i, p in ipairs(prompt) do
+                table.insert(msgs, {role = "user", content = p})
+            end
+            new_body.messages = msgs
+        end
+    end
+
+    -- 如果没有 messages，尝试从其他字段构建
+    if not new_body.messages and orig.content then
+        new_body.messages = {{role = "user", content = orig.content}}
     end
 
     -- 设置模型
@@ -189,39 +264,18 @@ local function rebuild_request_body(original_body, model, opt_config)
         end
     end
 
-    -- 返回 JSON
-    return json_encode(new_body)
-end
+    -- 转换为 JSON
+    local new_body_str = json_encode(new_body)
 
--- 简单的 JSON 编码 (只支持基本类型)
-function json_encode(t)
-    if type(t) == "table" then
-        local is_array = #t > 0
-        local parts = {}
-
-        if is_array then
-            for i, v in ipairs(t) do
-                table.insert(parts, json_encode(v))
-            end
-            return "[" .. table.concat(parts, ",") .. "]"
-        else
-            for k, v in pairs(t) do
-                table.insert(parts, '"' .. k .. '":' .. json_encode(v))
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-    elseif type(t) == "string" then
-        -- 简单转义
-        local escaped = t:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
-        return '"' .. escaped .. '"'
-    elseif type(t) == "number" then
-        return tostring(t)
-    elseif type(t) == "boolean" then
-        return t and "true" or "false"
-    else
-        return "null"
+    -- 调用 SDK 的 transform_request 进行额外转换
+    if provider_sdk and provider_sdk.transform_request then
+        new_body_str = provider_sdk.transform_request(new_body_str, model, provider_cfg)
     end
+
+    return new_body_str
 end
+
+-- json_encode 由 Rust 注册，不需要 Lua 端定义
 
 -------------------------------------------------------------------------------
 -- 主请求处理
@@ -281,8 +335,13 @@ function handler.on_request(method, path, headers, body)
     -- 获取 opt 配置
     local opt_config = get_opt_config(code_cfg.opt)
 
+    -- 加载 SDK
+    local provider_sdk = sdk.load(code_cfg.provider)
+
+    pcall(redis_set, "code:debug", "loaded sdk:" .. tostring(provider_sdk))
+
     -- 重建请求体
-    local new_body = rebuild_request_body(body, code_cfg.model, opt_config)
+    local new_body = rebuild_request_body(body, code_cfg.model, opt_config, provider_sdk, provider_cfg)
     if not new_body then
         return {
             action = "reject",
@@ -291,34 +350,47 @@ function handler.on_request(method, path, headers, body)
         }
     end
 
-    -- 获取 SDK 端点
-    local provider_sdk = sdk.load(code_cfg.provider)
+    -- 获取 SDK 端点 (只是路径前缀，如 /zen/go)
     local endpoint = "/v1/chat/completions"
     if provider_sdk and provider_sdk.get_endpoint then
         endpoint = provider_sdk.get_endpoint(provider_cfg.baseurl)
     end
 
-    -- 重写路径
-    local rewrite_path = endpoint
+    -- 提取 host (移除协议，保留路径前缀)
+    -- baseurl = https://opencode.ai/zen/go/v1/chat/completions
+    -- host = opencode.ai/zen/go
+    local host = provider_cfg.baseurl:gsub("^https?://", "")
+    host = host:gsub("/v1/chat/completions.*", "")
+    if host == "" then host = provider_cfg.baseurl:gsub("^https?://", "") end
+    local use_tls = string.sub(provider_cfg.baseurl, 1, 5) == "https"
+
+    -- 完整 URL = host + /v1/chat/completions
+    local rewrite_path = "/v1/chat/completions"
 
     -- 统计：调用次数
     local count_key = "code:" .. selected .. ":calls"
     pcall(redis_incr, count_key)
 
     -- 保存请求信息 (用于 on_response 中保存 raw)
+    request_id = request_id + 1
     current_request = {
+        id = request_id,
         body = new_body,
         selected = selected,
         provider = code_cfg.provider,
         model = code_cfg.model
     }
+    pcall(redis_set, "code:debug_id", "saved_id:" .. tostring(request_id))
+
+    -- 保存转换后的请求到 Redis (code:raw2)
+    save_translated_request(new_body, selected, code_cfg.provider, code_cfg.model)
 
     -- 返回代理决策
     return {
         action = "proxy",
         upstream = code_cfg.provider,
-        addr = provider_cfg.baseurl,
-        tls = string.sub(provider_cfg.baseurl, 1, 5) == "https",
+        addr = host,
+        tls = use_tls,
         sni = "",
         api_key = provider_cfg.apikey,
         model = code_cfg.model,
@@ -328,16 +400,27 @@ function handler.on_request(method, path, headers, body)
 end
 
 function handler.on_response(upstream, status, body)
-    -- 保存原始请求/响应到 Redis
+    -- 强制写入 Redis 以确认回调被调用
+    local ok = pcall(redis_set, "ON_RESPONSE_CALLED_V5", "YES_at_" .. os.date("%H%M%S"))
+    
+    local ts = os.date("%H%M%S")
+    pcall(redis_set, "RESPONSE_" .. ts, "called")
+    
     if current_request and current_request.body then
-        -- 尝试解析响应为 JSON，失败则用字符串
+        pcall(redis_set, "RESPONSE_" .. ts, "has_body")
+        
         local response_json = body
         if string.sub(body, 1, 1) == "{" or string.sub(body, 1, 1) == "[" then
             response_json = body
         else
             response_json = '"' .. body:gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
         end
+        
+        pcall(redis_set, "RESPONSE_" .. ts, "calling_save")
         save_raw_request(current_request.body, status, response_json)
+        pcall(redis_set, "RESPONSE_" .. ts .. "_done", "yes")
+    else
+        pcall(redis_set, "RESPONSE_" .. ts, "no_body")
     end
 end
 
