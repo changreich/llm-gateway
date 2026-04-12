@@ -38,6 +38,38 @@ pcall(redis_set, "router2_init_v4", os.date("%Y-%m-%d %H:%M:%S"))
 -------------------------------------------------------------------------------
 
 local function init_config_to_redis()
+    -- ============================================================
+    -- 始终更新 provider 和 global proxy 配置 (不受 initialized 影响)
+    -- ============================================================
+    local config_lua_path = script_dir .. "/config.lua"
+    local config_lua_file = loadfile(config_lua_path)
+    if config_lua_file then
+        local config_lua = config_lua_file()
+        if config_lua and config_lua.providers then
+            for name, cfg in pairs(config_lua.providers) do
+                local key = "provider:" .. name
+                local value = (cfg.baseurl or "") .. "|" .. (cfg.apikey or "")
+                pcall(redis_set, key, value)
+                -- 写入 provider 级代理配置 (始终更新)
+                if cfg.proxy then
+                    pcall(redis_set, "provider:" .. name .. ":proxy", cfg.proxy)
+                else
+                    -- 配置文件中无 proxy，删除 Redis 中的旧配置
+                    pcall(redis_del, "provider:" .. name .. ":proxy")
+                end
+            end
+        end
+        -- 写入全局代理配置 (始终更新)
+        if config_lua.proxy then
+            pcall(redis_set, "global:proxy", config_lua.proxy)
+        else
+            pcall(redis_del, "global:proxy")
+        end
+    end
+
+    -- ============================================================
+    -- 以下配置只在首次初始化时写入
+    -- ============================================================
     local ok, initialized = pcall(redis_get, "code:initialized")
 
     -- 如果 initialized 存在且为 "1"，检查 code:select 是否存在
@@ -56,11 +88,20 @@ local function init_config_to_redis()
         pcall(redis_set, "code:select", default_config.selected)
     end
 
-    -- 写入 code 配置
+    -- 写入全局代理配置 (来自 config2.lua)
+    if default_config.proxy then
+        pcall(redis_set, "global:proxy", default_config.proxy)
+    end
+
+    -- 写入 code 配置 (含 proxy)
     for num, cfg in pairs(default_code) do
         local key = "code:" .. num
         local value = (cfg.provider or "") .. "|" .. (cfg.model or "") .. "|" .. (cfg.opt or "")
         pcall(redis_set, key, value)
+        -- 写入 code 级代理配置
+        if cfg.proxy then
+            pcall(redis_set, "code:" .. num .. ":proxy", cfg.proxy)
+        end
     end
 
     -- 写入 opt 配置
@@ -76,20 +117,6 @@ local function init_config_to_redis()
         for model_name, num in pairs(default_config.modelmap) do
             local key = "modelmap:" .. model_name
             pcall(redis_set, key, num)
-        end
-    end
-
-    -- 加载 config.lua 中的 providers 并写入 Redis
-    local config_lua_path = script_dir .. "/config.lua"
-    local config_lua_file = loadfile(config_lua_path)
-    if config_lua_file then
-        local config_lua = config_lua_file()
-        if config_lua and config_lua.providers then
-            for name, cfg in pairs(config_lua.providers) do
-                local key = "provider:" .. name
-                local value = (cfg.baseurl or "") .. "|" .. (cfg.apikey or "")
-                pcall(redis_set, key, value)
-            end
         end
     end
 
@@ -265,6 +292,40 @@ local function get_opt_config(opt_str)
     end
 
     return result
+end
+
+--- 获取代理配置
+-- 优先级: code:{num}:proxy > provider:{name}:proxy > global:proxy
+-- @param code_num string 配置编号
+-- @param provider_name string 提供商名称
+-- @return string|nil 代理URL，nil表示直连
+local function get_proxy_config(code_num, provider_name)
+    -- 1. 模型级代理
+    local code_proxy = safe_redis_get("code:" .. code_num .. ":proxy")
+    if code_proxy then
+        if code_proxy == "" then
+            return nil  -- 空字符串强制直连
+        end
+        return code_proxy
+    end
+
+    -- 2. 提供商级代理
+    local provider_proxy = safe_redis_get("provider:" .. provider_name .. ":proxy")
+    if provider_proxy then
+        if provider_proxy == "" then
+            return nil
+        end
+        return provider_proxy
+    end
+
+    -- 3. 全局代理
+    local global_proxy = safe_redis_get("global:proxy")
+    if global_proxy and global_proxy ~= "" then
+        return global_proxy
+    end
+
+    -- 4. 无代理，直连
+    return nil
 end
 
 local function extract_tool_result_content(content)
@@ -755,6 +816,10 @@ function handler.on_request(method, path, headers, body)
     -- ★ 是否需要格式转换 (Anthropic provider 不需要)
     local need_transform = needs_format_conversion(code_cfg.provider, provider_cfg.baseurl)
 
+    -- ★ 获取代理配置
+    local proxy_url = get_proxy_config(selected, code_cfg.provider)
+    pcall(redis_set, "code:debug_proxy", proxy_url or "direct")
+
     -- 返回代理决策
     return {
         action = "proxy",
@@ -766,7 +831,8 @@ function handler.on_request(method, path, headers, body)
         model = code_cfg.model,
         rewrite_path = rewrite_path,
         new_request_body = new_body,
-        need_transform = need_transform
+        need_transform = need_transform,
+        proxy = proxy_url  -- 新增：代理URL
     }
 end
 

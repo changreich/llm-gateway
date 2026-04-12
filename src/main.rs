@@ -661,6 +661,7 @@ impl LuaRuntime {
             response_body: result.get("body").unwrap_or_default(),
             new_request_body: result.get("new_request_body").unwrap_or_default(),
             need_transform: result.get("need_transform").unwrap_or(true),  // 默认需要转换
+            proxy: result.get("proxy").ok().flatten(),  // 代理URL，None=直连
         })
     }
 
@@ -952,6 +953,7 @@ struct RequestDecision {
     response_body: String,
     new_request_body: String,  // Lua 返回的新请求体
     need_transform: bool,      // 是否需要格式转换 (Anthropic provider 直通时为 false)
+    proxy: Option<String>,     // 代理URL (None=直连)
 }
 
 impl Default for RequestDecision {
@@ -969,6 +971,7 @@ impl Default for RequestDecision {
             response_body: String::new(),
             new_request_body: String::new(),
             need_transform: true,  // 默认需要转换
+            proxy: None,  // 默认无代理，直连
         }
     }
 }
@@ -1149,9 +1152,26 @@ impl ProxyHttp for LuaGateway {
                     String::from_utf8_lossy(&body).to_string()
                 };
 
-                let client = reqwest::Client::builder()
-                    .danger_accept_invalid_certs(!*SKIP_TLS_VERIFY || !decision.tls)
-                    .build()
+                // 创建 reqwest 客户端，配置代理
+                let mut client_builder = reqwest::Client::builder()
+                    .danger_accept_invalid_certs(!*SKIP_TLS_VERIFY || !decision.tls);
+
+                // 配置代理
+                if let Some(proxy_url) = &decision.proxy {
+                    match reqwest::Proxy::all(proxy_url) {
+                        Ok(proxy) => {
+                            client_builder = client_builder.proxy(proxy);
+                            info!("[port:{}] Using proxy: {}", self.port, proxy_url);
+                        }
+                        Err(e) => {
+                            warn!("[port:{}] Invalid proxy URL {}: {}", self.port, proxy_url, e);
+                        }
+                    }
+                } else {
+                    info!("[port:{}] No proxy configured, direct connection", self.port);
+                }
+
+                let client = client_builder.build()
                     .map_err(|e| Error::explain(ErrorType::InternalError, format!("create client: {}", e)))?;
 
                 let mut req = client.post(&upstream_url)
