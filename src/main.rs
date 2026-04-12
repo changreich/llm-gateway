@@ -127,33 +127,6 @@ fn get_redis_conn() -> Option<RedisConnGuard<'static>> {
     REDIS_POOL.get()
 }
 
-fn get_selected_code_target() -> Option<(String, String, String)> {
-    let mut conn = get_redis_conn()?;
-    let selected = redis::cmd("GET")
-        .arg("code:select")
-        .query::<Option<String>>(&mut conn)
-        .ok()
-        .flatten()?;
-    if selected.is_empty() {
-        return None;
-    }
-
-    let code_key = format!("code:{}", selected);
-    let code_cfg = redis::cmd("GET")
-        .arg(&code_key)
-        .query::<Option<String>>(&mut conn)
-        .ok()
-        .flatten()?;
-
-    let mut parts = code_cfg.split('|');
-    let provider = parts.next().unwrap_or("").to_string();
-    let model = parts.next().unwrap_or("").to_string();
-    if provider.is_empty() && model.is_empty() {
-        return None;
-    }
-    Some((selected, provider, model))
-}
-
 /// TLS 证书验证开关 (默认跳过，因为有透明代理)
 static SKIP_TLS_VERIFY: Lazy<bool> = Lazy::new(|| {
     std::env::var("LLM_TLS_VERIFY").map(|v| v != "0" && v != "false").unwrap_or(false)
@@ -365,6 +338,49 @@ impl LuaRuntime {
             Ok(table)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_lrange: {}", e)))?;
         globals.set("redis_lrange", redis_lrange_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set redis_lrange: {}", e)))?;
+
+        // modelmap_get(model_name) -> num | nil
+        // 根据 model 名称查询映射的配置编号
+        let modelmap_get_fn = lua.create_function(|_lua, model_name: String| {
+            if model_name.is_empty() {
+                return Ok(None);
+            }
+
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+
+            // 精确匹配
+            let modelmap_key = format!("modelmap:{}", model_name);
+            if let Ok(Some(num)) = redis::cmd("GET")
+                .arg(&modelmap_key)
+                .query::<Option<String>>(&mut conn)
+            {
+                if !num.is_empty() {
+                    return Ok(Some(num));
+                }
+            }
+
+            // 前缀匹配 (model-name-xxx -> model-name)
+            let parts: Vec<&str> = model_name.split('-').collect();
+            if parts.len() > 1 {
+                // 尝试去掉最后一部分
+                let prefix = parts[..parts.len()-1].join("-");
+                let prefix_key = format!("modelmap:{}", prefix);
+                if let Ok(Some(num)) = redis::cmd("GET")
+                    .arg(&prefix_key)
+                    .query::<Option<String>>(&mut conn)
+                {
+                    if !num.is_empty() {
+                        return Ok(Some(num));
+                    }
+                }
+            }
+
+            Ok(None)
+        }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create modelmap_get: {}", e)))?;
+        globals.set("modelmap_get", modelmap_get_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set modelmap_get: {}", e)))?;
 
         info!("Redis functions registered to Lua");
         Ok(())
@@ -1082,38 +1098,9 @@ impl ProxyHttp for LuaGateway {
                     .ok()
                     .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()));
 
-                let selected_code_target = if self.port == 9089 {
-                    get_selected_code_target()
-                } else {
-                    None
-                };
-                if let Some((selected, provider, model)) = &selected_code_target {
-                    info!(
-                        "[port:{}] code:select={} -> provider={}, model={}",
-                        self.port, selected, provider, model
-                    );
-                    if !provider.is_empty() && *provider != decision.upstream {
-                        warn!(
-                            "[port:{}] code:select provider({}) differs from lua upstream({})",
-                            self.port, provider, decision.upstream
-                        );
-                    }
-                    if !model.is_empty() && !decision.model.is_empty() && *model != decision.model {
-                        warn!(
-                            "[port:{}] code:select model({}) differs from lua model({})",
-                            self.port, model, decision.model
-                        );
-                    }
-                }
-
-                let selected_model = selected_code_target
-                    .as_ref()
-                    .map(|(_, _, m)| m.clone())
-                    .unwrap_or_default();
+                // 目标模型优先级：Lua decision.model > 原始请求 model
                 let target_model_for_upstream = if !decision.model.is_empty() {
                     decision.model.clone()
-                } else if !selected_model.is_empty() {
-                    selected_model.clone()
                 } else {
                     original_model.clone().unwrap_or_default()
                 };

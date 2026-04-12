@@ -4,6 +4,7 @@
 --   Code: code:{num} -> provider|model|opt
 --   Opt:  opt:{id}:{field} -> value
 --   Select: code:select -> num
+--   ModelMap: modelmap:{model_name} -> num
 
 return {
     -- Redis 连接 (复用)
@@ -11,8 +12,17 @@ return {
     redis_port = 7379,
     redis_db = 0,
 
-    -- 当前选中的配置
-    selected = "01",
+    -- 当前选中的配置 (默认)
+    selected = "02",
+
+    -- Model 名称映射 (model_name -> num)
+    -- 优先级高于 code:select
+    modelmap = {
+        ["default"] = "02",
+        ["haru"] = "02",
+        ["claude-sonnet-4-20250514"] = "04",
+        ["claude-sonnet"] = "04",
+    },
 
     -- Code 配置
     code = {
@@ -23,13 +33,18 @@ return {
         },
         ["02"] = {
             provider = "openzen",
-            model = "mimo-v2-pro-free",
+            model = "minimax-m2.5-free",
             opt = ""  -- 无选项
         },
         ["03"] = {
             provider = "qfcode",
             model = "qianfan-code-latest",
             opt = ""  -- 使用 opt:01 和 opt:02
+        },
+        ["04"] = {
+            provider = "qfacode",     -- Anthropic API (baseurl含anthropic)
+            model = "ernie-4.5-turbo-20260402",  -- 百度千帆的coding模型
+            opt = ""
         }
     },
 

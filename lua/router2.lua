@@ -39,7 +39,7 @@ pcall(redis_set, "router2_init_v4", os.date("%Y-%m-%d %H:%M:%S"))
 
 local function init_config_to_redis()
     local ok, initialized = pcall(redis_get, "code:initialized")
-    
+
     -- 如果 initialized 存在且为 "1"，检查 code:select 是否存在
     if ok and initialized == "1" then
         local select_exists = pcall(redis_get, "code:select")
@@ -68,6 +68,14 @@ local function init_config_to_redis()
         for field, value in pairs(fields) do
             local key = "opt:" .. opt_id .. ":" .. field
             pcall(redis_set, key, value)
+        end
+    end
+
+    -- 写入 modelmap 配置
+    if default_config.modelmap then
+        for model_name, num in pairs(default_config.modelmap) do
+            local key = "modelmap:" .. model_name
+            pcall(redis_set, key, num)
         end
     end
 
@@ -164,6 +172,51 @@ local function get_code_config(num)
         model = parts[2],
         opt = parts[3] or ""
     }
+end
+
+-- 根据 model 名称查询映射的配置编号
+-- 返回: num | nil
+local function get_modelmap_num(model_name)
+    if not model_name or model_name == "" then
+        return nil
+    end
+
+    -- 精确匹配
+    local num = safe_redis_get("modelmap:" .. model_name)
+    if num then
+        return num
+    end
+
+    -- 前缀匹配 (model-name-xxx -> model-name)
+    local parts = {}
+    for part in string.gmatch(model_name, "[^-]+") do
+        table.insert(parts, part)
+    end
+
+    if #parts > 1 then
+        -- 尝试去掉最后一部分
+        local prefix = table.concat(parts, "-", 1, #parts - 1)
+        num = safe_redis_get("modelmap:" .. prefix)
+        if num then
+            return num
+        end
+    end
+
+    return nil
+end
+
+-- 解析请求体中的 model 字段
+local function extract_model_from_body(body)
+    if not body or body == "" then
+        return nil
+    end
+
+    local ok, parsed = pcall(json_decode, body)
+    if not ok or type(parsed) ~= "table" then
+        return nil
+    end
+
+    return parsed.model
 end
 
 -- 获取 provider 配置
@@ -588,8 +641,23 @@ function handler.on_request(method, path, headers, body)
         }
     end
 
-    -- 获取当前选中的配置序号
-    local selected = safe_redis_get("code:select") or "01"
+    -- 尝试从请求体提取 model 名称
+    local request_model = extract_model_from_body(body)
+
+    -- 根据 model 名称或 code:select 获取配置序号
+    -- 优先级: modelmap:{model} > code:select
+    local selected
+    if request_model then
+        selected = get_modelmap_num(request_model)
+        if selected then
+            pcall(redis_set, "code:debug_modelmap", string.format("model=%s -> num=%s", request_model, selected))
+        end
+    end
+
+    -- 如果 modelmap 没有映射，fallback 到 code:select
+    if not selected then
+        selected = safe_redis_get("code:select") or "01"
+    end
 
     -- 获取 code 配置
     local code_cfg = get_code_config(selected)
