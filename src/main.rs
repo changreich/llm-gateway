@@ -56,6 +56,14 @@ static STATS_MODELS: Lazy<RwLock<HashMap<String, ModelStats>>> = Lazy::new(|| Rw
 static STATS_SELECTED: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("01".to_string()));
 static STATS_CONFIG: Lazy<RwLock<HashMap<String, (String, String)>>> = Lazy::new(|| RwLock::new(HashMap::new())); // num -> (provider, model);
 
+/// Code 模型统计数据 (9089 端口)
+static CODE_STATS_TOTAL_CALLS: AtomicU64 = AtomicU64::new(0);
+static CODE_STATS_TOTAL_PROMPT: AtomicU64 = AtomicU64::new(0);
+static CODE_STATS_TOTAL_COMPLETION: AtomicU64 = AtomicU64::new(0);
+static CODE_STATS_MODELS: Lazy<RwLock<HashMap<String, ModelStats>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static CODE_STATS_SELECTED: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("01".to_string()));
+static CODE_STATS_CONFIG: Lazy<RwLock<HashMap<String, (String, String)>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+
 /// 简单的 Redis 连接池
 struct RedisConnPool {
     client: Client,
@@ -591,6 +599,45 @@ impl LuaRuntime {
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create stats_set_selected: {}", e)))?;
         globals.set("stats_set_selected", stats_set_selected_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set stats_set_selected: {}", e)))?;
 
+        // ============================================================
+        // Code 统计函数 (9089 端口)
+        // ============================================================
+
+        // stats_code_add(num, calls, prompt, completion) -> 累加统计
+        let stats_code_add_fn = lua.create_function(|_lua, (num, calls, prompt, completion): (String, u64, u64, u64)| {
+            CODE_STATS_TOTAL_CALLS.fetch_add(calls, Ordering::Relaxed);
+            CODE_STATS_TOTAL_PROMPT.fetch_add(prompt, Ordering::Relaxed);
+            CODE_STATS_TOTAL_COMPLETION.fetch_add(completion, Ordering::Relaxed);
+            if let Ok(mut models) = CODE_STATS_MODELS.write() {
+                let entry = models.entry(num).or_insert_with(ModelStats::default);
+                entry.calls += calls;
+                entry.prompt += prompt;
+                entry.completion += completion;
+                entry.last_prompt = prompt;
+                entry.last_completion = completion;
+            }
+            Ok(())
+        }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create stats_code_add: {}", e)))?;
+        globals.set("stats_code_add", stats_code_add_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set stats_code_add: {}", e)))?;
+
+        // stats_code_set_config(num, provider, model) -> 设置 Code 模型配置
+        let stats_code_set_config_fn = lua.create_function(|_lua, (num, provider, model): (String, String, String)| {
+            if let Ok(mut config) = CODE_STATS_CONFIG.write() {
+                config.insert(num, (provider, model));
+            }
+            Ok(())
+        }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create stats_code_set_config: {}", e)))?;
+        globals.set("stats_code_set_config", stats_code_set_config_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set stats_code_set_config: {}", e)))?;
+
+        // stats_code_set_selected(num) -> 设置当前选中的 Code 模型
+        let stats_code_set_selected_fn = lua.create_function(|_lua, num: String| {
+            if let Ok(mut selected) = CODE_STATS_SELECTED.write() {
+                *selected = num;
+            }
+            Ok(())
+        }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create stats_code_set_selected: {}", e)))?;
+        globals.set("stats_code_set_selected", stats_code_set_selected_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set stats_code_set_selected: {}", e)))?;
+
         info!("OpenAI functions registered to Lua");
         Ok(())
     }
@@ -857,23 +904,23 @@ fn lua_to_json(val: &mlua::Value) -> serde_json::Value {
 
 /// 生成 /running 页面 HTML（从 Rust 全局缓存读取，无阻塞）
 fn generate_running_html() -> String {
-    let total_calls = STATS_TOTAL_CALLS.load(Ordering::Relaxed);
-    let total_prompt = STATS_TOTAL_PROMPT.load(Ordering::Relaxed);
-    let total_completion = STATS_TOTAL_COMPLETION.load(Ordering::Relaxed);
-    let total_tokens = total_prompt + total_completion;
+    // LLM 统计 (9090 端口)
+    let llm_calls = STATS_TOTAL_CALLS.load(Ordering::Relaxed);
+    let llm_prompt = STATS_TOTAL_PROMPT.load(Ordering::Relaxed);
+    let llm_completion = STATS_TOTAL_COMPLETION.load(Ordering::Relaxed);
 
-    let selected = STATS_SELECTED.read().map(|s| s.clone()).unwrap_or_else(|_| "01".to_string());
-    let config = STATS_CONFIG.read().map(|c| c.clone()).unwrap_or_else(|_| HashMap::new());
-    let models = STATS_MODELS.read().map(|m| m.clone()).unwrap_or_else(|_| HashMap::new());
+    let llm_selected = STATS_SELECTED.read().map(|s| s.clone()).unwrap_or_else(|_| "01".to_string());
+    let llm_config = STATS_CONFIG.read().map(|c| c.clone()).unwrap_or_else(|_| HashMap::new());
+    let llm_models = STATS_MODELS.read().map(|m| m.clone()).unwrap_or_else(|_| HashMap::new());
 
-    let mut model_rows = String::new();
-    let mut nums: Vec<String> = config.keys().cloned().collect();
+    let mut llm_rows = String::new();
+    let mut nums: Vec<String> = llm_config.keys().cloned().collect();
     nums.sort();
 
     for num in &nums {
-        let (provider, model) = config.get(num).cloned().unwrap_or_else(|| ("?".to_string(), "?".to_string()));
-        let stats = models.get(num).cloned().unwrap_or_default();
-        let is_selected = num == &selected;
+        let (provider, model) = llm_config.get(num).cloned().unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+        let stats = llm_models.get(num).cloned().unwrap_or_default();
+        let is_selected = num == &llm_selected;
         let sel_class = if is_selected { " class=\"selected\"" } else { "" };
         let sel_mark = if is_selected { " *" } else { "" };
         let last = if stats.last_prompt > 0 {
@@ -882,50 +929,73 @@ fn generate_running_html() -> String {
             "-".to_string()
         };
 
-        model_rows.push_str(&format!(
+        llm_rows.push_str(&format!(
             "<tr{}><td><span class=\"num\">{}</span>{}</td><td><span class=\"provider\">{}</span></td><td style=\"font-size:0.8em;color:#666\">{}</td><td>{}</td><td class=\"prompt\">{}</td><td class=\"completion\">{}</td><td style=\"font-size:0.8em;color:#888\">{}</td></tr>",
             sel_class, num, sel_mark, provider, model, stats.calls, stats.prompt, stats.completion, last
         ));
     }
+    if llm_rows.is_empty() {
+        llm_rows = "<tr><td colspan=\"7\" style=\"color:#999;text-align:center\">暂无数据</td></tr>".to_string();
+    }
 
-    // SSE 连接状态
-    let sse_connections = sse_stream::sse_get_active_connections();
-    let sse_count = sse_connections.len();
-    let mut sse_rows = String::new();
-    for conn in &sse_connections {
-        let elapsed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64 - conn.created_at;
-        sse_rows.push_str(&format!(
-            "<tr><td>#{}<td>{}</td><td style=\"font-size:0.8em\">{}</td><td>{}</td><td>{}ms</td></tr>",
-            conn.id,
-            if conn.client_request_id.is_empty() { "-" } else { &conn.client_request_id },
-            if conn.openai_sse_id.is_empty() { "pending..." } else { &conn.openai_sse_id },
-            conn.model,
-            elapsed,
+    // Code 统计 (9089 端口)
+    let code_calls = CODE_STATS_TOTAL_CALLS.load(Ordering::Relaxed);
+    let code_prompt = CODE_STATS_TOTAL_PROMPT.load(Ordering::Relaxed);
+    let code_completion = CODE_STATS_TOTAL_COMPLETION.load(Ordering::Relaxed);
+
+    let code_selected = CODE_STATS_SELECTED.read().map(|s| s.clone()).unwrap_or_else(|_| "01".to_string());
+    let code_config = CODE_STATS_CONFIG.read().map(|c| c.clone()).unwrap_or_else(|_| HashMap::new());
+    let code_models = CODE_STATS_MODELS.read().map(|m| m.clone()).unwrap_or_else(|_| HashMap::new());
+
+    let mut code_rows = String::new();
+    let mut code_nums: Vec<String> = code_config.keys().cloned().collect();
+    code_nums.sort();
+
+    for num in &code_nums {
+        let (provider, model) = code_config.get(num).cloned().unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+        let stats = code_models.get(num).cloned().unwrap_or_default();
+        let is_selected = num == &code_selected;
+        let sel_class = if is_selected { " class=\"selected\"" } else { "" };
+        let sel_mark = if is_selected { " *" } else { "" };
+        let last = if stats.last_prompt > 0 {
+            format!("<span class=\"prompt\">{}</span>+<span class=\"completion\">{}</span>", stats.last_prompt, stats.last_completion)
+        } else {
+            "-".to_string()
+        };
+
+        code_rows.push_str(&format!(
+            "<tr{}><td><span class=\"num\">{}</span>{}</td><td><span class=\"provider\">{}</span></td><td style=\"font-size:0.8em;color:#666\">{}</td><td>{}</td><td class=\"prompt\">{}</td><td class=\"completion\">{}</td><td style=\"font-size:0.8em;color:#888\">{}</td></tr>",
+            sel_class, num, sel_mark, provider, model, stats.calls, stats.prompt, stats.completion, last
         ));
     }
-    if sse_rows.is_empty() {
-        sse_rows = "<tr><td colspan=\"5\" style=\"color:#999;text-align:center\">无活跃连接</td></tr>".to_string();
+    if code_rows.is_empty() {
+        code_rows = "<tr><td colspan=\"7\" style=\"color:#999;text-align:center\">暂无数据</td></tr>".to_string();
     }
 
     format!(r#"<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>LLM Gateway</title>
-<style>body{{font-family:sans-serif;max-width:900px;margin:40px auto;padding:20px;background:#f5f5f5}}h1{{color:#333;border-bottom:2px solid #4CAF50;padding-bottom:10px}}h2{{color:#555;margin-top:25px}}.card{{background:white;border-radius:8px;padding:20px;margin:15px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:10px;border-bottom:1px solid #eee}}th{{background:#f9f9f9}}.stat-box{{display:inline-block;background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:12px 20px;border-radius:8px;margin:5px;text-align:center}}.stat-box .v{{font-size:1.4em;font-weight:bold}}.stat-box .l{{font-size:0.75em;opacity:0.9}}.stat-box.green{{background:linear-gradient(135deg,#11998e,#38ef7d)}}.stat-box.orange{{background:linear-gradient(135deg,#f093fb,#f5576c)}}.num{{font-family:monospace;background:#e3f2fd;padding:2px 6px;border-radius:4px}}.provider{{color:#1976d2;font-weight:500}}.selected{{background:#fff3e0}}.prompt{{color:#4CAF50}}.completion{{color:#2196F3}}</style>
+<style>body{{font-family:sans-serif;max-width:1000px;margin:40px auto;padding:20px;background:#f5f5f5}}h1{{color:#333;border-bottom:2px solid #4CAF50;padding-bottom:10px}}h2{{color:#555;margin-top:25px;font-size:1.1em}}.card{{background:white;border-radius:8px;padding:20px;margin:15px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}.stat-box{{display:inline-block;background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:10px 16px;border-radius:8px;margin:4px;text-align:center;font-size:0.9em}}.stat-box .v{{font-size:1.3em;font-weight:bold}}.stat-box .l{{font-size:0.7em;opacity:0.9}}.stat-box.green{{background:linear-gradient(135deg,#11998e,#38ef7d)}}.stat-box.orange{{background:linear-gradient(135deg,#f093fb,#f5576c)}}.stat-box.blue{{background:linear-gradient(135deg,#4facfe,#00f2fe)}}.port-label{{font-size:0.75em;color:#888;background:#eee;padding:2px 6px;border-radius:4px;margin-left:8px}}table{{width:100%;border-collapse:collapse;font-size:0.9em}}th,td{{text-align:left;padding:8px;border-bottom:1px solid #eee}}th{{background:#f9f9f9;font-weight:600}}.num{{font-family:monospace;background:#e3f2fd;padding:2px 6px;border-radius:4px}}.provider{{color:#1976d2;font-weight:500}}.selected{{background:#fff3e0}}.prompt{{color:#4CAF50}}.completion{{color:#2196F3}}.section-header{{display:flex;align-items:center;margin-bottom:10px}}</style>
 </head><body><h1>LLM Gateway</h1>
-<div class="stat-box"><div class="v">{}</div><div class="l">调用次数</div></div>
+<div class="card">
+<div class="section-header"><h2>LLM 模型统计</h2><span class="port-label">端口 9090</span></div>
+<div class="stat-box"><div class="v">{}</div><div class="l">调用</div></div>
 <div class="stat-box green"><div class="v">{}</div><div class="l">Prompt</div></div>
 <div class="stat-box orange"><div class="v">{}</div><div class="l">Completion</div></div>
-<div class="stat-box"><div class="v">{}</div><div class="l">总Token</div></div>
-<div class="card"><h2>模型统计</h2><table>
+<table>
 <tr><th>编号</th><th>提供商</th><th>模型</th><th>调用</th><th class="prompt">Prompt</th><th class="completion">Completion</th><th>最近</th></tr>
-{}</table></div>
-<div class="card"><h2>SSE 流连接 <span style="font-size:0.8em;color:#888\">({} active)</span></h2><table>
-<tr><th>ID</th><th>Client ID</th><th>OpenAI SSE ID</th><th>Model</th><th>Elapsed</th></tr>
-{}</table></div>
-<p style="color:#999;text-align:center;margin-top:20px">LLM Gateway | <a href="/debug">debug</a> | <a href="/config">config</a> | <a href="/raw">raw</a> | <a href="/sse">sse json</a></p>
-</body></html>"#, total_calls, total_prompt, total_completion, total_tokens, model_rows, sse_count, sse_rows)
+{}</table>
+</div>
+<div class="card">
+<div class="section-header"><h2>Code 模型统计</h2><span class="port-label">端口 9089</span></div>
+<div class="stat-box blue"><div class="v">{}</div><div class="l">调用</div></div>
+<div class="stat-box green"><div class="v">{}</div><div class="l">Prompt</div></div>
+<div class="stat-box orange"><div class="v">{}</div><div class="l">Completion</div></div>
+<table>
+<tr><th>编号</th><th>提供商</th><th>模型</th><th>调用</th><th class="prompt">Prompt</th><th class="completion">Completion</th><th>最近</th></tr>
+{}</table>
+</div>
+<p style="color:#999;text-align:center;margin-top:20px;font-size:0.85em">LLM Gateway | <a href="/debug">debug</a> | <a href="/config">config</a> | <a href="/raw">raw</a></p>
+</body></html>"#, llm_calls, llm_prompt, llm_completion, llm_rows, code_calls, code_prompt, code_completion, code_rows)
 }
 
 #[derive(Clone, Default, Debug)]

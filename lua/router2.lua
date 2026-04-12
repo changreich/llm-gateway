@@ -820,6 +820,10 @@ function handler.on_request(method, path, headers, body)
     local proxy_url = get_proxy_config(selected, code_cfg.provider)
     pcall(redis_set, "code:debug_proxy", proxy_url or "direct")
 
+    -- ★ 更新统计配置 (Rust 全局变量)
+    pcall(stats_code_set_config, selected, code_cfg.provider, code_cfg.model)
+    pcall(stats_code_set_selected, selected)
+
     -- 返回代理决策
     return {
         action = "proxy",
@@ -839,23 +843,43 @@ end
 function handler.on_response(upstream, status, body)
     -- 强制写入 Redis 以确认回调被调用
     local ok = pcall(redis_set, "ON_RESPONSE_CALLED_V5", "YES_at_" .. os.date("%H%M%S"))
-    
+
     local ts = os.date("%H%M%S")
     pcall(redis_set, "RESPONSE_" .. ts, "called")
-    
+
     if current_request and current_request.body then
         pcall(redis_set, "RESPONSE_" .. ts, "has_body")
-        
+
         local response_json = body
         if string.sub(body, 1, 1) == "{" or string.sub(body, 1, 1) == "[" then
             response_json = body
         else
             response_json = '"' .. body:gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
         end
-        
+
         pcall(redis_set, "RESPONSE_" .. ts, "calling_save")
         save_raw_request(current_request.body, status, response_json)
         pcall(redis_set, "RESPONSE_" .. ts .. "_done", "yes")
+
+        -- ★ 提取 token 并更新统计
+        if status == 200 and current_request.selected then
+            local ok_parse, parsed = pcall(json_decode, body)
+            if ok_parse and type(parsed) == "table" then
+                local input_tokens = 0
+                local output_tokens = 0
+
+                -- OpenAI 格式: usage.prompt_tokens / usage.completion_tokens
+                -- Anthropic 格式: usage.input_tokens / usage.output_tokens
+                if parsed.usage then
+                    input_tokens = parsed.usage.prompt_tokens or parsed.usage.input_tokens or 0
+                    output_tokens = parsed.usage.completion_tokens or parsed.usage.output_tokens or 0
+                end
+
+                if input_tokens > 0 then
+                    pcall(stats_code_add, current_request.selected, 1, input_tokens, output_tokens)
+                end
+            end
+        end
     else
         pcall(redis_set, "RESPONSE_" .. ts, "no_body")
     end
