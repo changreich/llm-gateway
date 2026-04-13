@@ -41,14 +41,28 @@ REDIS_URL=redis://127.0.0.1:7379 LLM_LISTEN=0.0.0.0:9090 ./target/release/llm-ga
 
 ## Endpoints
 
+### Port 9090 (LLM Router)
 | Endpoint | Description |
 |----------|-------------|
 | `/running` | Real-time statistics dashboard |
 | `/debug` | Current routing status |
 | `/config` | View LLM configuration |
-| `/v1/chat/completions` | Chat Completions API |
+| `/openai/v1/chat/completions` | Chat Completions API |
 | `/v1/embeddings` | Embeddings API |
 | `/rerank` | Rerank API |
+
+### Port 9089 (Code Router)
+| Endpoint | Description |
+|----------|-------------|
+| `/running` | Code model statistics |
+| Any URL containing `code` | Code model requests |
+
+### Port 9093 (Admin Console)
+| Endpoint | Description |
+|----------|-------------|
+| `/` | Web UI for configuration management |
+| `/api/*` | REST API for CRUD operations |
+| `/api/export-config` | Export Redis config to config.lua |
 
 ## Failover Mechanism
 
@@ -59,14 +73,62 @@ REDIS_URL=redis://127.0.0.1:7379 LLM_LISTEN=0.0.0.0:9090 ./target/release/llm-ga
 
 ## Configuration
 
+### Config File (`lua/config.lua`)
+
+```lua
+return {
+    redis_host = "127.0.0.1",
+    redis_port = 7379,
+    redis_db = 0,
+
+    cool_down = 60,
+    llm_selected = "01",   -- LLM 默认选中
+    code_selected = "05",  -- Code 默认选中
+
+    -- 全局代理 (可选)
+    -- proxy = "http://127.0.0.1:7890",
+
+    providers = {
+        zhipu = {baseurl = "...", apikey = "...", proxy = "..."},
+        -- ...
+    },
+
+    llm = {
+        ["01"] = {provider = "zhipu", model = "GLM-4-Flash", cd = 10},
+        -- ...
+    },
+
+    code = {
+        ["01"] = {provider = "qfacode", model = "glm-5", opt = "", proxy = ""},
+        -- ...
+    },
+
+    opt = {
+        ["01"] = {max_tokens = "12280"},
+    },
+
+    modelmap = {
+        ["default"] = "05",
+        ["claude-sonnet"] = "04",
+    },
+
+    embed = {provider = "Local1", model = "..."},
+    rank = {provider = "Local2", model = "..."}
+}
+```
+
 ### Redis Keys
 
 | Key | Format | Example |
 |-----|--------|---------|
 | `provider:{name}` | `baseurl\|apikey` | `https://api.siliconflow.cn/v1\|sk-xxx` |
+| `provider:{name}:proxy` | Proxy URL | `socks5://127.0.0.1:7890` |
 | `llm:{num}` | `provider\|model\|cd` | `siliconflow\|Qwen/Qwen3.5-4B\|15` |
 | `llm:select` | Current primary LLM number | `01` |
-| `llm:config:switch_threshold` | Switch threshold | `10` |
+| `code:{num}` | `provider\|model\|opt` | `qfacode\|glm-5\|01` |
+| `code:select` | Current primary Code number | `05` |
+| `opt:{id}:{field}` | Option value | `12280` |
+| `modelmap:{name}` | Config number(s) | `05` or `05,08,09` |
 
 ### Environment Variables
 
