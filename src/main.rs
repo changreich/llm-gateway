@@ -1380,12 +1380,29 @@ impl ProxyHttp for LuaGateway {
                     // 关闭响应流
                     session.write_response_body(None, true).await?;
 
-                    info!("[SSE-REG#{}] SSE stream transformation completed (openai_id={})", conn_id, state.msg_id);
+                    info!("[SSE-REG#{}] SSE stream transformation completed (openai_id={}, tokens: {}+{})",
+                        conn_id, state.msg_id, state.input_tokens, state.output_tokens);
 
                     ctx.response_status = 200;
-                    if let Ok(lua) = self.lua.read() {
-                        lua.call_on_response(&decision.upstream, 200, b"streaming response");
+
+                    // ★ SSE 流结束时上报 token 统计
+                    if state.input_tokens > 0 || state.output_tokens > 0 {
+                        let selected = CODE_STATS_SELECTED.read().map(|s| s.clone()).unwrap_or_else(|_| "01".to_string());
+                        CODE_STATS_TOTAL_CALLS.fetch_add(1, Ordering::Relaxed);
+                        CODE_STATS_TOTAL_PROMPT.fetch_add(state.input_tokens, Ordering::Relaxed);
+                        CODE_STATS_TOTAL_COMPLETION.fetch_add(state.output_tokens, Ordering::Relaxed);
+                        if let Ok(mut models) = CODE_STATS_MODELS.write() {
+                            let entry = models.entry(selected.clone()).or_insert_with(ModelStats::default);
+                            entry.calls += 1;
+                            entry.prompt += state.input_tokens;
+                            entry.completion += state.output_tokens;
+                            entry.last_prompt = state.input_tokens;
+                            entry.last_completion = state.output_tokens;
+                        }
+                        info!("[SSE-REG#{}] Stats updated: num={}, prompt={}, completion={}",
+                            conn_id, selected, state.input_tokens, state.output_tokens);
                     }
+
                     sse_unregister(conn_id);
                     return Ok(true);
                 }
@@ -1410,20 +1427,70 @@ impl ProxyHttp for LuaGateway {
                         return Ok(true);
                     }
 
-                    // 直接透传 SSE 流
+                    // 直接透传 SSE 流，同时解析 token 统计
                     let mut resp = ResponseHeader::build(200, None)?;
                     resp.insert_header("Content-Type", "text/event-stream")?;
                     resp.insert_header("Cache-Control", "no-cache")?;
                     resp.insert_header("Connection", "keep-alive")?;
                     session.write_response_header(Box::new(resp), false).await?;
 
+                    // 用于解析 SSE 并提取 token
+                    let mut sse_parser = SseLineParser::new();
+                    let mut total_input_tokens: u64 = 0;
+                    let mut total_output_tokens: u64 = 0;
+
                     let mut stream_response = response;
                     while let Some(chunk) = stream_response.chunk().await.map_err(|e| {
                         Error::explain(ErrorType::InternalError, format!("passthrough chunk read error: {}", e))
                     })? {
+                        // 解析 SSE 提取 token
+                        sse_parser.push_data(&chunk);
+                        let lines = sse_parser.extract_lines();
+                        for line in lines {
+                            if line == "[DONE]" {
+                                continue;
+                            }
+                            // 尝试解析 JSON 提取 usage
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                                if let Some(usage) = v.get("usage") {
+                                    if let Some(pt) = usage.get("input_tokens").and_then(|t| t.as_u64()) {
+                                        total_input_tokens = pt;
+                                    }
+                                    if let Some(ct) = usage.get("output_tokens").and_then(|t| t.as_u64()) {
+                                        total_output_tokens += ct;
+                                    }
+                                    // OpenAI 格式兼容
+                                    if let Some(pt) = usage.get("prompt_tokens").and_then(|t| t.as_u64()) {
+                                        total_input_tokens = pt;
+                                    }
+                                    if let Some(ct) = usage.get("completion_tokens").and_then(|t| t.as_u64()) {
+                                        total_output_tokens += ct;
+                                    }
+                                }
+                            }
+                        }
                         session.write_response_body(Some(chunk), false).await?;
                     }
                     session.write_response_body(None, true).await?;
+
+                    // ★ A→A passthrough 流结束时上报 token 统计
+                    if total_input_tokens > 0 || total_output_tokens > 0 {
+                        let selected = CODE_STATS_SELECTED.read().map(|s| s.clone()).unwrap_or_else(|_| "01".to_string());
+                        CODE_STATS_TOTAL_CALLS.fetch_add(1, Ordering::Relaxed);
+                        CODE_STATS_TOTAL_PROMPT.fetch_add(total_input_tokens, Ordering::Relaxed);
+                        CODE_STATS_TOTAL_COMPLETION.fetch_add(total_output_tokens, Ordering::Relaxed);
+                        if let Ok(mut models) = CODE_STATS_MODELS.write() {
+                            let entry = models.entry(selected.clone()).or_insert_with(ModelStats::default);
+                            entry.calls += 1;
+                            entry.prompt += total_input_tokens;
+                            entry.completion += total_output_tokens;
+                            entry.last_prompt = total_input_tokens;
+                            entry.last_completion = total_output_tokens;
+                        }
+                        info!("[port:{}] A→A passthrough stats: num={}, prompt={}, completion={}",
+                            self.port, selected, total_input_tokens, total_output_tokens);
+                    }
+
                     return Ok(true);
                 }
 

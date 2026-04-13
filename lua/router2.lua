@@ -182,6 +182,15 @@ local function safe_redis_get(key)
     return nil
 end
 
+-- 安全 INCR Redis 值，返回递增后的数值
+local function safe_redis_incr(key)
+    local ok, val = pcall(redis_incr, key)
+    if ok and val then
+        return tonumber(val) or 0
+    end
+    return 0
+end
+
 -- 获取 code 配置
 local function get_code_config(num)
     local config = safe_redis_get("code:" .. num)
@@ -201,7 +210,38 @@ local function get_code_config(num)
     }
 end
 
+-- 解析 modelmap 值，支持单值和多值轮询
+-- 单值 "05" -> 直接返回 "05"
+-- 多值 "05,08,09" -> 轮询返回其中一个
+-- 返回: code_num | nil
+local function resolve_modelmap_value(value, model_name)
+    if not value then return nil end
+
+    -- 不含逗号：单值，直接返回
+    if not string.find(value, ",") then
+        return value
+    end
+
+    -- 含逗号：多值轮询
+    local nums = {}
+    for num in string.gmatch(value, "[^,]+") do
+        table.insert(nums, num)
+    end
+    if #nums == 0 then return nil end
+
+    -- 轮询：INCR 索引，取模
+    local idx_key = "modelmap:" .. model_name .. ":idx"
+    local idx = safe_redis_incr(idx_key) - 1  -- INCR 先加1返回，减1得到当前轮次
+    local pos = (idx % #nums) + 1  -- Lua 索引从 1 开始
+
+    pcall(redis_set, "code:debug_modelmap_rr",
+        string.format("model=%s idx=%d pos=%d selected=%s", model_name, idx, pos, nums[pos]))
+
+    return nums[pos]
+end
+
 -- 根据 model 名称查询映射的配置编号
+-- 支持：单值 "05" 或多值轮询 "05,08,09"
 -- 返回: num | nil
 local function get_modelmap_num(model_name)
     if not model_name or model_name == "" then
@@ -209,9 +249,9 @@ local function get_modelmap_num(model_name)
     end
 
     -- 精确匹配
-    local num = safe_redis_get("modelmap:" .. model_name)
-    if num then
-        return num
+    local mapped = safe_redis_get("modelmap:" .. model_name)
+    if mapped then
+        return resolve_modelmap_value(mapped, model_name)
     end
 
     -- 前缀匹配 (model-name-xxx -> model-name)
@@ -223,9 +263,9 @@ local function get_modelmap_num(model_name)
     if #parts > 1 then
         -- 尝试去掉最后一部分
         local prefix = table.concat(parts, "-", 1, #parts - 1)
-        num = safe_redis_get("modelmap:" .. prefix)
-        if num then
-            return num
+        mapped = safe_redis_get("modelmap:" .. prefix)
+        if mapped then
+            return resolve_modelmap_value(mapped, prefix)
         end
     end
 
@@ -758,11 +798,35 @@ function handler.on_request(method, path, headers, body)
         }
     end
 
+    -- ★★★ SiliconFlow Anthropic 端点特殊处理 ★★★
+    -- 当 baseurl 是 https://api.siliconflow.cn/anthropic/v1 时：
+    -- 需要重写为 https://api.siliconflow.cn，路径设为 /v1/messages
+    local silianthropic_sdk = nil
+    local sf_anthropic_match = false
+
+    -- 尝试加载 SiliconFlow Anthropic SDK（通过特殊检测）
+    local ok_sf, sf_sdk = pcall(dofile, script_dir .. "/sdk/sdk_siliconflow_anthropic.lua")
+    if ok_sf and sf_sdk and sf_sdk.match and sf_sdk.match(provider_cfg.baseurl) then
+        silianthropic_sdk = sf_sdk
+        sf_anthropic_match = true
+        pcall(redis_set, "code:debug_sdk", "silianthropic_matched")
+    end
+
     -- 获取端点路径
     -- Anthropic provider: /v1/messages
     -- OpenAI 兼容 provider: /v1/chat/completions (或 SDK 定义)
     local endpoint = "/v1/chat/completions"
-    if string.find(string.lower(provider_cfg.baseurl), "anthropic") then
+    local baseurl = provider_cfg.baseurl
+    local use_tls = string.sub(baseurl, 1, 5) == "https"
+
+    -- ★★★ 应用 SDK 重写逻辑 ★★★
+    if silianthropic_sdk then
+        -- SiliconFlow Anthropic: 重写 baseurl 并设置端点
+        baseurl = silianthropic_sdk.rewrite_baseurl(baseurl)
+        use_tls = string.sub(baseurl, 1, 5) == "https"
+        endpoint = silianthropic_sdk.get_endpoint(baseurl)
+        pcall(redis_set, "code:debug_rewrite", string.format("siliconflow: baseurl=%s endpoint=%s", baseurl, endpoint))
+    elseif string.find(string.lower(provider_cfg.baseurl), "anthropic") then
         endpoint = "/v1/messages"
     elseif provider_sdk and provider_sdk.get_endpoint then
         endpoint = provider_sdk.get_endpoint(provider_cfg.baseurl)
@@ -770,29 +834,33 @@ function handler.on_request(method, path, headers, body)
 
     -- 提取 host 和 rewrite_path
     -- 统一逻辑：从 baseurl 分离 host 和 path，再拼接 endpoint
-    local baseurl = provider_cfg.baseurl
-    local use_tls = string.sub(baseurl, 1, 5) == "https"
-
+    -- 注意：baseurl 可能已被重写
     -- 去掉协议前缀
     local url_body = baseurl:gsub("^https?://", "")
 
     -- 分离 host 和 path
-    -- url_body: "qianfan.baidubce.com/anthropic/coding" 或 "api.openai.com"
+    -- url_body: "api.siliconflow.cn" 或 "api.openai.com"
     local host, path_prefix = url_body:match("^([^/]+)(.*)")
     if not host then
         host = url_body  -- 无路径的情况
         path_prefix = ""
     end
 
-    -- ★ 对于 Anthropic provider，endpoint 已经是完整路径
+    -- ★ 对于 Anthropic provider 或重写后的 baseurl，endpoint 已经是完整路径
     -- rewrite_path = path_prefix + endpoint
-    -- 例: /anthropic/coding + /v1/messages = /anthropic/coding/v1/messages
+    -- 例: "" + /v1/messages = /v1/messages (重写后)
+    -- 例: /anthropic/coding + /v1/messages = /anthropic/coding/v1/messages (未重写)
     local rewrite_path = path_prefix .. endpoint
+
+    -- ★★★ 特殊情况：如果 baseurl 被 SDK 重写过，path_prefix 应该为空 ★★★
+    if silianthropic_sdk then
+        rewrite_path = endpoint  -- 直接使用 endpoint，忽略 path_prefix
+    end
 
     -- DEBUG: 保存路由信息
     pcall(redis_set, "code:debug_route", string.format(
-        "host=%s|endpoint=%s|path_prefix=%s|rewrite_path=%s",
-        host, endpoint, path_prefix, rewrite_path
+        "host=%s|endpoint=%s|path_prefix=%s|rewrite_path=%s|sf_match=%s",
+        host, endpoint, path_prefix, rewrite_path, tostring(sf_anthropic_match)
     ))
 
     -- 统计：调用次数

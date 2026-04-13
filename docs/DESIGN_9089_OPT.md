@@ -1,5 +1,35 @@
 # 9089 端口请求转换优化设计
 
+## ✅ 实现状态：已完成 (2026-04-13)
+
+### 已完成的工作
+
+| 项目 | 状态 | 文件 |
+|------|------|------|
+| SiliconFlow Anthropic SDK | ✅ 完成 | `lua/sdk/sdk_siliconflow_anthropic.lua` |
+| router2.lua SDK 集成 | ✅ 完成 | `lua/router2.lua` 第 761-824 行 |
+| Rust SSE 透传 | ✅ 已存在 | `src/main.rs` 第 1413-1495 行 |
+| 非流式响应透传 | ✅ 已存在 | `src/main.rs` 第 1583 行 |
+
+### 验证方法
+
+```bash
+# 配置 Redis
+redis-cli -p 7379 SET provider:siliflowa "https://api.siliconflow.cn/anthropic/v1|YOUR_API_KEY"
+redis-cli -p 7379 SET code:08 "siliflowa|Pro/zai-org/GLM-5.1|"
+
+# 发送测试请求
+curl -X POST http://localhost:9089/xxx/code/xxx \
+  -H "Content-Type: application/json" \
+  -d '{"model": "haru", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 100}'
+
+# 检查调试键
+redis-cli -p 7379 GET code:debug_route
+# 期望: host=api.siliconflow.cn|endpoint=/v1/messages|path_prefix=|rewrite_path=/v1/messages|sf_match=true
+```
+
+---
+
 ## 需求背景
 
 当前 `router2.lua` 的 `rebuild_request_body()` 函数会**无条件**将 Anthropic 格式转换为 OpenAI 格式。但存在以下场景不需要转换：

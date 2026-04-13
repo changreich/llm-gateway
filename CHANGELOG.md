@@ -1,5 +1,27 @@
 # Changelog
 
+## [2026-04-13] v0.1.3 - SiliconFlow Anthropic 端点适配
+
+### 新增
+
+- **SiliconFlow Anthropic SDK**: 新增 `sdk_siliconflow_anthropic.lua`，支持 SiliconFlow 的 Anthropic 兼容端点
+- **baseurl 重写逻辑**: 当 baseurl 为 `https://api.siliconflow.cn/anthropic/v1` 时，自动重写为 `https://api.siliconflow.cn`，路径设为 `/v1/messages`
+- **调试日志增强**: 新增 `code:debug_sdk` 和 `code:debug_rewrite` Redis 调试键
+
+### 修复
+
+- 修复 SiliconFlow Anthropic 端点路径计算 bug（原路径 `/anthropic/v1/v1/messages` 修正为 `/v1/messages`）
+
+### 行为变化
+
+```
+之前: SiliconFlow Anthropic baseurl → 错误路径 /anthropic/v1/v1/messages
+现在: SiliconFlow Anthropic baseurl → 正确路径 /v1/messages
+     同时保持 Anthropic 格式透传（不转换）
+```
+
+---
+
 ## [2026-04-11] v0.1.2 - Anthropic 完整支持 + 端口分离
 
 ### 新增
