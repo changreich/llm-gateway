@@ -17,8 +17,8 @@ current_request = nil
 -- 脚本初始化完成标记 (v6)
 pcall(redis_set, "ROUTER2_V6_LOADED", "YES_" .. os.date("%H:%M:%S"))
 
--- 从 config2.lua 加载默认配置
-local config_path = script_dir .. "/config2.lua"
+-- 从 config.lua 加载默认配置
+local config_path = script_dir .. "/config.lua"
 local config_file = loadfile(config_path)
 local default_config = config_file and config_file() or {}
 
@@ -34,37 +34,32 @@ pcall(redis_set, "router2_init_check", os.date("%H:%M:%S") .. "_test")
 pcall(redis_set, "router2_init_v4", os.date("%Y-%m-%d %H:%M:%S"))
 
 -------------------------------------------------------------------------------
--- 初始化：将 config2.lua 配置写入 Redis
+-- 初始化：将 config.lua 配置写入 Redis
 -------------------------------------------------------------------------------
 
 local function init_config_to_redis()
     -- ============================================================
     -- 始终更新 provider 和 global proxy 配置 (不受 initialized 影响)
     -- ============================================================
-    local config_lua_path = script_dir .. "/config.lua"
-    local config_lua_file = loadfile(config_lua_path)
-    if config_lua_file then
-        local config_lua = config_lua_file()
-        if config_lua and config_lua.providers then
-            for name, cfg in pairs(config_lua.providers) do
-                local key = "provider:" .. name
-                local value = (cfg.baseurl or "") .. "|" .. (cfg.apikey or "")
-                pcall(redis_set, key, value)
-                -- 写入 provider 级代理配置 (始终更新)
-                if cfg.proxy then
-                    pcall(redis_set, "provider:" .. name .. ":proxy", cfg.proxy)
-                else
-                    -- 配置文件中无 proxy，删除 Redis 中的旧配置
-                    pcall(redis_del, "provider:" .. name .. ":proxy")
-                end
+    if default_config.providers then
+        for name, cfg in pairs(default_config.providers) do
+            local key = "provider:" .. name
+            local value = (cfg.baseurl or "") .. "|" .. (cfg.apikey or "")
+            pcall(redis_set, key, value)
+            -- 写入 provider 级代理配置 (始终更新)
+            if cfg.proxy then
+                pcall(redis_set, "provider:" .. name .. ":proxy", cfg.proxy)
+            else
+                -- 配置文件中无 proxy，删除 Redis 中的旧配置
+                pcall(redis_del, "provider:" .. name .. ":proxy")
             end
         end
-        -- 写入全局代理配置 (始终更新)
-        if config_lua.proxy then
-            pcall(redis_set, "global:proxy", config_lua.proxy)
-        else
-            pcall(redis_del, "global:proxy")
-        end
+    end
+    -- 写入全局代理配置 (始终更新)
+    if default_config.proxy then
+        pcall(redis_set, "global:proxy", default_config.proxy)
+    else
+        pcall(redis_del, "global:proxy")
     end
 
     -- ============================================================
@@ -84,11 +79,11 @@ local function init_config_to_redis()
     end
 
     -- 先设置默认选中，确保 code:select 最早被创建
-    if default_config.selected then
-        pcall(redis_set, "code:select", default_config.selected)
+    if default_config.code_selected then
+        pcall(redis_set, "code:select", default_config.code_selected)
     end
 
-    -- 写入全局代理配置 (来自 config2.lua)
+    -- 写入全局代理配置
     if default_config.proxy then
         pcall(redis_set, "global:proxy", default_config.proxy)
     end

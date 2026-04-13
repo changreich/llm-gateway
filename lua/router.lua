@@ -88,7 +88,7 @@ local function init_config_to_redis()
         pcall(redis_set, "rank:model", default_rank.model)
     end
 
-    pcall(redis_set, "llm:select", default_config.selected or "01")
+    pcall(redis_set, "llm:select", default_config.llm_selected or "01")
     pcall(redis_set, "llm:config:cool_down", tostring(cool_down))
     pcall(redis_set, "llm:initialized", "1")
 end
@@ -190,7 +190,7 @@ local function load_config()
         llm = {},
         embed = {},
         rank = {},
-        selected = default_config.selected or "01"
+        selected = default_config.llm_selected or "01"
     }
 
     local ok, selected = pcall(redis_get, "llm:select")
@@ -256,7 +256,7 @@ local function load_config()
 end
 
 -------------------------------------------------------------------------------
--- LLM 模型选择 (负载均衡)
+-- LLM 模型选择 (轮询 + CD 跳过)
 -------------------------------------------------------------------------------
 
 local function get_model_cool_down(num)
@@ -274,68 +274,67 @@ local function is_in_cool_down(num)
     if ok and cool_until_str and cool_until_str ~= "" then
         local cool_until = tonumber(cool_until_str) or 0
         if os.time() < cool_until then
-            return true
+            return true, cool_until
         end
     end
-    return false
+    return false, nil
 end
 
--- 获取模型调用次数
-local function get_model_calls(num)
-    local model_key = "llm:model:" .. num
-    local ok, calls = pcall(redis_get, model_key .. ":calls")
-    if ok and calls and calls ~= "" then
-        return tonumber(calls) or 0
+-- 设置模型进入冷却状态
+local function set_model_cool_down(num)
+    if not num then return end
+    local cd = get_model_cool_down(num)
+    if cd <= 0 then return end
+    local cool_down_key = "llm:cool-down:" .. num
+    local cool_until = os.time() + cd
+    pcall(redis_set, cool_down_key, tostring(cool_until))
+    pcall(redis_expire, cool_down_key, cd + 10)
+    pcall(redis_set, "llm:cd:log:" .. num,
+        string.format("set at %s for %ds until %d", os.date("%H:%M:%S"), cd, cool_until))
+end
+
+-- 安全 INCR Redis 值
+local function safe_redis_incr(key)
+    local ok, val = pcall(redis_incr, key)
+    if ok and val then
+        return tonumber(val) or 0
     end
     return 0
 end
 
--- 选择最优模型：不在CD + 调用次数最少（同次数随机选择）
+-- 轮询选择模型：跳过 cd 中的模型
+-- 返回: cfg, num, all_in_cd
 local function select_llm(config)
-    local candidates = {}  -- 候选模型列表
-    local min_calls = math.huge
+    -- 获取所有模型编号并排序
+    local nums = {}
+    for n in pairs(config.llm) do
+        table.insert(nums, n)
+    end
+    if #nums == 0 then
+        return nil, nil, true
+    end
+    table.sort(nums)
 
-    -- 第一遍：找出最小调用次数
-    for num, cfg in pairs(config.llm) do
-        if not is_in_cool_down(num) then
-            local calls = get_model_calls(num)
-            if calls < min_calls then
-                min_calls = calls
-            end
+    -- 轮询索引
+    local idx_key = "llm:poll:idx"
+    local start_idx = safe_redis_incr(idx_key) - 1
+
+    -- 遍历所有模型，找到第一个不在 cd 中的
+    for i = 0, #nums - 1 do
+        local pos = ((start_idx + i) % #nums) + 1
+        local num = nums[pos]
+        local in_cd, cool_until = is_in_cool_down(num)
+        if not in_cd then
+            local cfg = config.llm[num]
+            pcall(redis_set, "llm:debug_poll",
+                string.format("idx=%d pos=%d selected=%s", start_idx, pos, num))
+            return cfg, num, false
         end
     end
 
-    -- 第二遍：收集所有调用次数等于最小值的模型
-    for num, cfg in pairs(config.llm) do
-        if not is_in_cool_down(num) then
-            local calls = get_model_calls(num)
-            if calls == min_calls then
-                table.insert(candidates, {num = num, cfg = cfg})
-            end
-        end
-    end
-
-    -- 如果没有可用模型，使用主用模型
-    if #candidates == 0 then
-        local main_num = config.selected or "01"
-        return config.llm[main_num], main_num, false
-    end
-
-    -- 从候选中随机选择（打破确定性顺序）
-    local idx = math.random(1, #candidates)
-    local chosen = candidates[idx]
-    local best_num = chosen.num
-    local best_cfg = chosen.cfg
-
-    -- 设置冷却时间（防止同一模型被频繁选中）
-    local this_cd = get_model_cool_down(best_num)
-    if this_cd > 0 then
-        local cool_down_key = "llm:cool-down:" .. best_num
-        pcall(redis_set, cool_down_key, tostring(os.time() + this_cd))
-        pcall(redis_expire, cool_down_key, this_cd + 10)
-    end
-
-    return best_cfg, best_num, false
+    -- 所有模型都在 cd 中
+    pcall(redis_set, "llm:debug_poll", "all_in_cd")
+    return nil, nil, true
 end
 
 -------------------------------------------------------------------------------
@@ -479,6 +478,24 @@ function handler.on_request(method, path, headers, body)
             return { action = "reject", status = 200, body = result }
         end
         return { action = "reject", status = 200, body = "[]" }
+    end
+
+    -- /cd 端点：查看所有模型的 cd 状态
+    if path == "/cd" then
+        local status_list = {}
+        for num, cfg in pairs(config.llm) do
+            local in_cd, cool_until = is_in_cool_down(num)
+            local cd_seconds = get_model_cool_down(num)
+            table.insert(status_list, string.format(
+                '{"num":"%s","provider":"%s","model":"%s","in_cd":%s,"cool_until":%s,"cd_seconds":%d}',
+                num, cfg.provider or "", cfg.model or "",
+                in_cd and "true" or "false",
+                cool_until or "null",
+                cd_seconds
+            ))
+        end
+        table.sort(status_list)
+        return { action = "reject", status = 200, body = "[" .. table.concat(status_list, ",") .. "]" }
     end
 
     -- /running 端点：展示运行统计（调用次数、token消耗）
@@ -626,12 +643,14 @@ function handler.on_request(method, path, headers, body)
     -- LLM 路由：只处理 /openai 前缀的请求
     -- /openai/v1/chat/completions 或 /openai/chat/completions
     if path:match("^/openai/") then
-        local llm_cfg, target_num = select_llm(config)
-        if not llm_cfg then
+        local llm_cfg, target_num, all_in_cd = select_llm(config)
+
+        -- 所有模型都在 cd 中，返回 429
+        if all_in_cd or not llm_cfg then
             return {
                 action = "reject",
-                status = 503,
-                body = '{"error":"No LLM config available"}'
+                status = 429,
+                body = '{"error":"all models in cooldown","retry_after":' .. cool_down .. '}'
             }
         end
 
@@ -640,19 +659,16 @@ function handler.on_request(method, path, headers, body)
         -- 使用 SDK 调用 LLM (model 字段会被替换为配置的模型)
         local response = call_llm_sdk(llm_cfg, body)
 
-        -- 检查响应是否成功（包含 error 字段表示失败）
+        -- 检查响应是否失败（包含 error 字段表示失败）
         local has_error = response:match('"error"')
         local has_valid_response = response:match('"choices"') or response:match('"data"')
 
-        -- 如果失败且不是主用模型，用主用模型重试
-        if has_error and not has_valid_response and model_num ~= config.selected then
-            local main_num = config.selected or "01"
-            local main_cfg = config.llm[main_num]
-            if main_cfg then
-                response = call_llm_sdk(main_cfg, body)
-                model_num = main_num
-                llm_cfg = main_cfg
-            end
+        -- 如果失败，设置该模型进入 cd
+        if has_error and not has_valid_response then
+            set_model_cool_down(model_num)
+            pcall(redis_incr, "llm:errors:" .. model_num)
+            pcall(redis_set, "llm:last_error:" .. model_num,
+                string.format("time=%s", os.date("%H:%M:%S")))
         end
 
         -- 计数：按模型编号统计

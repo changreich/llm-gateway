@@ -1,0 +1,1624 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Gateway Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f8fafc;
+  --bg-subtle: #f1f5f9;
+  --sidebar-bg: #ffffff;
+  --card: #ffffff;
+  --text: #1e293b;
+  --text-secondary: #64748b;
+  --text-muted: #94a3b8;
+  --border: #e2e8f0;
+  --border-light: #f1f5f9;
+  --accent: #0ea5e9;
+  --accent-hover: #0284c7;
+  --accent-muted: rgba(14, 165, 233, 0.1);
+  --success: #10b981;
+  --success-hover: #059669;
+  --warning: #f59e0b;
+  --warning-hover: #d97706;
+  --danger: #ef4444;
+  --danger-hover: #dc2626;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+  --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.08), 0 2px 4px -1px rgba(0,0,0,0.04);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --sidebar-width: 200px;
+}
+
+.dark {
+  --bg: #0f172a;
+  --bg-subtle: #1e293b;
+  --sidebar-bg: #1e293b;
+  --card: #1e293b;
+  --text: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --border: #334155;
+  --border-light: #1e293b;
+  --accent: #38bdf8;
+  --accent-hover: #0ea5e9;
+  --accent-muted: rgba(56, 189, 248, 0.15);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.2);
+  --shadow: 0 1px 3px rgba(0,0,0,0.25), 0 1px 2px rgba(0,0,0,0.2);
+  --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.3), 0 2px 4px -1px rgba(0,0,0,0.2);
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: 'Noto Sans SC', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  min-height: 100vh;
+  transition: background 0.3s ease, color 0.3s ease;
+}
+
+/* Layout */
+.layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  z-index: 100;
+}
+
+.sidebar-header {
+  padding: 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo-icon {
+  width: 32px;
+  height: 32px;
+  background: linear-gradient(135deg, var(--accent) 0%, #8b5cf6 100%);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.logo-text {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.logo-sub {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.nav {
+  flex: 1;
+  padding: 12px 8px;
+  overflow-y: auto;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  margin: 2px 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.nav-item:hover {
+  background: var(--bg-subtle);
+  color: var(--text);
+}
+
+.nav-item.active {
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.nav-item-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.nav-icon {
+  font-size: 1rem;
+  width: 20px;
+  text-align: center;
+}
+
+.nav-badge {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  background: var(--bg-subtle);
+  border-radius: 12px;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.nav-item.active .nav-badge {
+  background: var(--accent);
+  color: white;
+}
+
+.sidebar-footer {
+  padding: 16px;
+  border-top: 1px solid var(--border);
+}
+
+/* Main Content */
+.main {
+  flex: 1;
+  margin-left: var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* Header */
+.header {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  padding: 0 24px;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+.header-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 4px 8px;
+  background: var(--bg-subtle);
+  border-radius: 20px;
+  cursor: pointer;
+  transition: background 0.2s;
+  font-size: 0.85rem;
+}
+
+.theme-toggle:hover {
+  background: var(--border);
+}
+
+.theme-toggle input {
+  width: 36px;
+  height: 20px;
+  appearance: none;
+  background: var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  position: relative;
+  transition: background 0.3s;
+}
+
+.theme-toggle input::before {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 16px;
+  height: 16px;
+  background: var(--card);
+  border-radius: 50%;
+  transition: transform 0.3s ease;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
+.theme-toggle input:checked {
+  background: var(--accent);
+}
+
+.theme-toggle input:checked::before {
+  transform: translateX(16px);
+}
+
+/* Content Area */
+.content {
+  flex: 1;
+  padding: 24px;
+  max-width: 1200px;
+}
+
+/* Detail Panel */
+.detail-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  margin-bottom: 20px;
+  display: none;
+}
+
+.detail-panel.active {
+  display: block;
+  animation: fadeIn 0.2s ease;
+}
+
+.detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-title {
+  font-size: 1rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.detail-id {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--accent-muted);
+  color: var(--accent);
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+}
+
+.detail-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.detail-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-group.full-width {
+  grid-column: 1 / -1;
+}
+
+.form-group label {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.form-group input,
+.form-group select,
+.form-group textarea {
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+  font-family: inherit;
+  background: var(--bg);
+  color: var(--text);
+  transition: all 0.2s;
+}
+
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-muted);
+}
+
+/* List View */
+.list-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+}
+
+.list-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.list-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.list-filter {
+  display: flex;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.list-filter input,
+.list-filter select {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  background: var(--card);
+  color: var(--text);
+}
+
+/* Table */
+.table-wrapper {
+  overflow-x: auto;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+th, td {
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+th {
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: var(--bg-subtle);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+tbody tr {
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+tbody tr:hover {
+  background: var(--bg-subtle);
+}
+
+tbody tr.selected {
+  background: var(--accent-muted);
+}
+
+.num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.num.active {
+  color: var(--accent);
+}
+
+.provider {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.model {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.status-dot.ok { background: var(--success); }
+.status-dot.cd { background: var(--warning); }
+
+/* Empty State */
+.empty-state {
+  padding: 48px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.empty-state-icon {
+  font-size: 3rem;
+  margin-bottom: 16px;
+}
+
+/* Buttons */
+.btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: white;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.btn-success {
+  background: var(--success);
+  color: white;
+}
+
+.btn-success:hover {
+  background: var(--success-hover);
+}
+
+.btn-warning {
+  background: var(--warning);
+  color: white;
+}
+
+.btn-warning:hover {
+  background: var(--warning-hover);
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: white;
+}
+
+.btn-danger:hover {
+  background: var(--danger-hover);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+
+.btn-ghost:hover {
+  background: var(--bg-subtle);
+  color: var(--text);
+}
+
+.btn-sm {
+  padding: 6px 12px;
+  font-size: 0.8rem;
+}
+
+/* Toast Notifications */
+.toast-container {
+  position: fixed;
+  top: 80px;
+  right: 24px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.toast {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 20px;
+  box-shadow: var(--shadow-md);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 280px;
+  animation: slideIn 0.3s ease;
+}
+
+.toast.success {
+  border-left: 3px solid var(--success);
+}
+
+.toast.error {
+  border-left: 3px solid var(--danger);
+}
+
+.toast-message {
+  flex: 1;
+  font-size: 0.9rem;
+}
+
+.toast-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1.2rem;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.toast-close:hover {
+  color: var(--text);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(20px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* Section specific styles */
+.section-content {
+  display: none;
+}
+
+.section-content.active {
+  display: block;
+  animation: fadeIn 0.2s ease;
+}
+
+/* Stats */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.stat-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.stat-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.stat-value {
+  font-size: 2rem;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--accent);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: fixed;
+    bottom: 0;
+    top: auto;
+    flex-direction: row;
+    border-right: none;
+    border-top: 1px solid var(--border);
+  }
+
+  .sidebar-header,
+  .sidebar-footer {
+    display: none;
+  }
+
+  .nav {
+    flex-direction: row;
+    padding: 8px;
+    width: 100%;
+    justify-content: space-around;
+  }
+
+  .nav-item {
+    flex-direction: column;
+    padding: 8px 12px;
+    gap: 4px;
+  }
+
+  .nav-item-left {
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .nav-badge {
+    display: none;
+  }
+
+  .main {
+    margin-left: 0;
+    margin-bottom: 70px;
+  }
+
+  .content {
+    padding: 16px;
+  }
+}
+
+/* Loading spinner */
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+</style>
+</head>
+<body>
+
+<div class="layout">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">
+        <div class="logo-icon">GW</div>
+        <div>
+          <div class="logo-text">LLM Gateway</div>
+          <div class="logo-sub">配置管理</div>
+        </div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-item active" data-section="llm">
+        <div class="nav-item-left">
+          <span class="nav-icon">🤖</span>
+          <span>LLM</span>
+        </div>
+        <span class="nav-badge">{{LLM_COUNT}}</span>
+      </div>
+      <div class="nav-item" data-section="code">
+        <div class="nav-item-left">
+          <span class="nav-icon">💻</span>
+          <span>Code</span>
+        </div>
+        <span class="nav-badge">{{CODE_COUNT}}</span>
+      </div>
+      <div class="nav-item" data-section="provider">
+        <div class="nav-item-left">
+          <span class="nav-icon">🔌</span>
+          <span>Provider</span>
+        </div>
+        <span class="nav-badge">{{PROVIDER_COUNT}}</span>
+      </div>
+      <div class="nav-item" data-section="opt">
+        <div class="nav-item-left">
+          <span class="nav-icon">⚙️</span>
+          <span>Opt</span>
+        </div>
+        <span class="nav-badge">{{OPT_COUNT}}</span>
+      </div>
+      <div class="nav-item" data-section="modelmap">
+        <div class="nav-item-left">
+          <span class="nav-icon">🗺️</span>
+          <span>ModelMap</span>
+        </div>
+        <span class="nav-badge">{{MODELMAP_COUNT}}</span>
+      </div>
+      <div class="nav-item" data-section="stats">
+        <div class="nav-item-left">
+          <span class="nav-icon">📊</span>
+          <span>统计</span>
+        </div>
+      </div>
+    </nav>
+
+    <div class="sidebar-footer">
+      <label class="theme-toggle">
+        <span>☀️</span>
+        <input type="checkbox" onchange="toggleTheme()">
+        <span>🌙</span>
+      </label>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="main">
+    <!-- Header -->
+    <header class="header">
+      <h1 class="header-title" id="section-title">LLM 配置</h1>
+      <div class="header-actions">
+        <button class="btn btn-warning" onclick="exportConfig()">
+          <span>📁</span> 导出配置
+        </button>
+        <button class="btn btn-primary" onclick="showAddForm()">
+          <span>+</span> 添加配置
+        </button>
+      </div>
+    </header>
+
+    <!-- Content -->
+    <div class="content">
+
+      <!-- LLM Section -->
+      <div class="section-content active" id="section-llm">
+        <!-- Detail Panel -->
+        <div class="detail-panel" id="llm-detail">
+          <div class="detail-header">
+            <div class="detail-title">
+              编辑配置 <span class="detail-id" id="llm-detail-id">--</span>
+            </div>
+            <div class="detail-actions">
+              <button class="btn btn-success" onclick="saveLlmDetail()">保存修改</button>
+              <button class="btn btn-ghost" onclick="clearLlmDetailCd()">清除 CD</button>
+              <button class="btn btn-danger" onclick="deleteLlmDetail()">删除</button>
+            </div>
+          </div>
+          <div class="detail-form">
+            <div class="form-group">
+              <label>Provider</label>
+              <select id="llm-detail-provider">{{PROVIDER_OPTIONS}}</select>
+            </div>
+            <div class="form-group">
+              <label>Model</label>
+              <input type="text" id="llm-detail-model" placeholder="输入模型名称">
+            </div>
+            <div class="form-group">
+              <label>Cool Down (秒)</label>
+              <input type="number" id="llm-detail-cd" placeholder="60">
+            </div>
+            <div class="form-group">
+              <label>当前状态</label>
+              <div id="llm-detail-status" class="status">
+                <span class="status-dot ok"></span>
+                <span>正常</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- List Panel -->
+        <div class="list-panel">
+          <div class="list-header">
+            <span class="list-title">配置列表</span>
+            <div class="list-actions">
+              <span style="color:var(--text-muted);font-size:0.8rem">点击行查看详情</span>
+            </div>
+          </div>
+          <div class="list-filter">
+            <input type="text" placeholder="搜索模型..." id="llm-search" oninput="filterLlm()">
+            <select id="llm-filter-provider" onchange="filterLlm()">
+              <option value="">全部 Provider</option>
+              {{PROVIDER_OPTIONS}}
+            </select>
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>编号</th>
+                  <th>Provider</th>
+                  <th>Model</th>
+                  <th>CD</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="llm-table-body">
+                {{LLM_ROWS}}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Code Section -->
+      <div class="section-content" id="section-code">
+        <div class="detail-panel" id="code-detail">
+          <div class="detail-header">
+            <div class="detail-title">
+              编辑配置 <span class="detail-id" id="code-detail-id">--</span>
+            </div>
+            <div class="detail-actions">
+              <button class="btn btn-success" onclick="saveCodeDetail()">保存修改</button>
+              <button class="btn btn-ghost" onclick="clearCodeDetailCd()">清除 CD</button>
+              <button class="btn btn-danger" onclick="deleteCodeDetail()">删除</button>
+            </div>
+          </div>
+          <div class="detail-form">
+            <div class="form-group">
+              <label>Provider</label>
+              <select id="code-detail-provider">{{PROVIDER_OPTIONS}}</select>
+            </div>
+            <div class="form-group">
+              <label>Model</label>
+              <input type="text" id="code-detail-model" placeholder="输入模型名称">
+            </div>
+            <div class="form-group">
+              <label>Opt ID</label>
+              <input type="text" id="code-detail-opt" placeholder="可选">
+            </div>
+          </div>
+        </div>
+
+        <div class="list-panel">
+          <div class="list-header">
+            <span class="list-title">配置列表</span>
+          </div>
+          <div class="list-filter">
+            <input type="text" placeholder="搜索模型..." id="code-search" oninput="filterCode()">
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>编号</th>
+                  <th>Provider</th>
+                  <th>Model</th>
+                  <th>Opt</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="code-table-body">
+                {{CODE_ROWS}}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Provider Section -->
+      <div class="section-content" id="section-provider">
+        <div class="detail-panel" id="provider-detail">
+          <div class="detail-header">
+            <div class="detail-title">
+              编辑 Provider <span class="detail-id" id="provider-detail-id">--</span>
+            </div>
+            <div class="detail-actions">
+              <button class="btn btn-success" onclick="saveProviderDetail()">保存修改</button>
+              <button class="btn btn-danger" onclick="deleteProviderDetail()">删除</button>
+            </div>
+          </div>
+          <div class="detail-form">
+            <div class="form-group full-width">
+              <label>Base URL</label>
+              <input type="text" id="provider-detail-url" placeholder="https://api.example.com/v1">
+            </div>
+            <div class="form-group full-width">
+              <label>API Key</label>
+              <input type="text" id="provider-detail-key" placeholder="sk-...">
+            </div>
+            <div class="form-group">
+              <label>代理 (可选)</label>
+              <input type="text" id="provider-detail-proxy" placeholder="socks5://127.0.0.1:7890">
+            </div>
+          </div>
+        </div>
+
+        <div class="list-panel">
+          <div class="list-header">
+            <span class="list-title">Provider 列表</span>
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>名称</th>
+                  <th>Base URL</th>
+                  <th>代理</th>
+                </tr>
+              </thead>
+              <tbody id="provider-table-body">
+                {{PROVIDER_ROWS}}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Opt Section -->
+      <div class="section-content" id="section-opt">
+        <div class="detail-panel" id="opt-detail">
+          <div class="detail-header">
+            <div class="detail-title">
+              编辑 Opt <span class="detail-id" id="opt-detail-id">--</span>
+            </div>
+            <div class="detail-actions">
+              <button class="btn btn-success" onclick="saveOptDetail()">保存修改</button>
+              <button class="btn btn-danger" onclick="deleteOptDetail()">删除</button>
+            </div>
+          </div>
+          <div class="detail-form">
+            <div class="form-group full-width">
+              <label>配置项 (key=value, 逗号分隔)</label>
+              <input type="text" id="opt-detail-fields" placeholder="max_tokens=4096, temperature=0.7">
+            </div>
+          </div>
+        </div>
+
+        <div class="list-panel">
+          <div class="list-header">
+            <span class="list-title">Opt 列表</span>
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>编号</th>
+                  <th>配置</th>
+                </tr>
+              </thead>
+              <tbody id="opt-table-body">
+                {{OPT_ROWS}}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ModelMap Section -->
+      <div class="section-content" id="section-modelmap">
+        <div class="detail-panel" id="modelmap-detail">
+          <div class="detail-header">
+            <div class="detail-title">
+              编辑映射 <span class="detail-id" id="modelmap-detail-id">--</span>
+            </div>
+            <div class="detail-actions">
+              <button class="btn btn-success" onclick="saveModelmapDetail()">保存修改</button>
+              <button class="btn btn-danger" onclick="deleteModelmapDetail()">删除</button>
+            </div>
+          </div>
+          <div class="detail-form">
+            <div class="form-group">
+              <label>模型名</label>
+              <input type="text" id="modelmap-detail-name" placeholder="claude-sonnet">
+            </div>
+            <div class="form-group">
+              <label>映射值 (多值用逗号分隔)</label>
+              <input type="text" id="modelmap-detail-value" placeholder="05,08,09">
+            </div>
+          </div>
+        </div>
+
+        <div class="list-panel">
+          <div class="list-header">
+            <span class="list-title">ModelMap 列表</span>
+          </div>
+          <div class="list-filter">
+            <input type="text" placeholder="搜索模型名..." id="modelmap-search" oninput="filterModelmap()">
+          </div>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>模型名</th>
+                  <th>映射值</th>
+                </tr>
+              </thead>
+              <tbody id="modelmap-table-body">
+                {{MODELMAP_ROWS}}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Stats Section -->
+      <div class="section-content" id="section-stats">
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">总调用次数</div>
+            <div class="stat-value">{{TOTAL_CALLS}}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">LLM 配置数</div>
+            <div class="stat-value">{{LLM_COUNT}}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Code 配置数</div>
+            <div class="stat-value">{{CODE_COUNT}}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Provider 数</div>
+            <div class="stat-value">{{PROVIDER_COUNT}}</div>
+          </div>
+        </div>
+        <div style="margin-top: 24px; text-align: center;">
+          <button class="btn btn-danger" onclick="resetAllStats()">重置所有统计</button>
+        </div>
+      </div>
+
+    </div>
+  </main>
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toast-container"></div>
+
+<script>
+// ===== Theme =====
+function toggleTheme() {
+  document.documentElement.classList.toggle('dark');
+  localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
+}
+(function() {
+  if (localStorage.getItem('theme') === 'dark') {
+    document.documentElement.classList.add('dark');
+  }
+})();
+
+// ===== Navigation =====
+const sections = ['llm', 'code', 'provider', 'opt', 'modelmap', 'stats'];
+let currentSection = 'llm';
+
+// Data storage
+let llmData = [], codeData = [], providerData = [], optData = [], modelmapData = [];
+
+// Initialize data from rendered content
+document.addEventListener('DOMContentLoaded', function() {
+  // Parse data from table rows
+  parseDataFromTables();
+
+  // Setup navigation
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.addEventListener('click', () => switchSection(item.dataset.section));
+  });
+
+  // Setup row click handlers
+  setupRowClicks();
+
+  // Show first section
+  switchSection('llm');
+});
+
+function switchSection(section) {
+  currentSection = section;
+
+  // Update nav
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.classList.toggle('active', item.dataset.section === section);
+  });
+
+  // Update content
+  document.querySelectorAll('.section-content').forEach(content => {
+    content.classList.toggle('active', content.id === 'section-' + section);
+  });
+
+  // Update header title
+  const titles = {
+    llm: 'LLM 配置',
+    code: 'Code 配置',
+    provider: 'Provider 配置',
+    opt: 'Opt 配置',
+    modelmap: 'ModelMap 配置',
+    stats: '统计信息'
+  };
+  document.getElementById('section-title').textContent = titles[section];
+
+  // Hide detail panels when switching
+  document.querySelectorAll('.detail-panel').forEach(p => p.classList.remove('active'));
+}
+
+function parseDataFromTables() {
+  // This will be populated from the rendered HTML
+  // For now, we'll work with what's in the DOM
+}
+
+function setupRowClicks() {
+  // LLM rows
+  document.querySelectorAll('#llm-table-body tr').forEach(row => {
+    row.addEventListener('click', () => showLlmDetail(row.dataset.id));
+  });
+
+  // Code rows
+  document.querySelectorAll('#code-table-body tr').forEach(row => {
+    row.addEventListener('click', () => showCodeDetail(row.dataset.id));
+  });
+
+  // Provider rows (use data-name)
+  document.querySelectorAll('#provider-table-body tr').forEach(row => {
+    row.addEventListener('click', () => showProviderDetail(row.dataset.name));
+  });
+
+  // Opt rows
+  document.querySelectorAll('#opt-table-body tr').forEach(row => {
+    row.addEventListener('click', () => showOptDetail(row.dataset.id));
+  });
+
+  // ModelMap rows (use data-name)
+  document.querySelectorAll('#modelmap-table-body tr').forEach(row => {
+    row.addEventListener('click', () => showModelmapDetail(row.dataset.name));
+  });
+}
+
+// ===== Detail Panel Functions =====
+function showLlmDetail(id) {
+  const panel = document.getElementById('llm-detail');
+  document.getElementById('llm-detail-id').textContent = id;
+  panel.classList.add('active');
+
+  // Highlight selected row
+  document.querySelectorAll('#llm-table-body tr').forEach(tr => tr.classList.remove('selected'));
+  const row = document.querySelector(`#llm-table-body tr[data-id="${id}"]`);
+  if (row) {
+    row.classList.add('selected');
+    // Load data from row attributes
+    document.getElementById('llm-detail-provider').value = row.dataset.provider || '';
+    document.getElementById('llm-detail-model').value = row.dataset.model || '';
+    document.getElementById('llm-detail-cd').value = row.dataset.cd || '60';
+  }
+}
+
+function showCodeDetail(id) {
+  const panel = document.getElementById('code-detail');
+  document.getElementById('code-detail-id').textContent = id;
+  panel.classList.add('active');
+
+  document.querySelectorAll('#code-table-body tr').forEach(tr => tr.classList.remove('selected'));
+  const row = document.querySelector(`#code-table-body tr[data-id="${id}"]`);
+  if (row) {
+    row.classList.add('selected');
+    document.getElementById('code-detail-provider').value = row.dataset.provider || '';
+    document.getElementById('code-detail-model').value = row.dataset.model || '';
+    document.getElementById('code-detail-opt').value = row.dataset.opt || '';
+  }
+}
+
+function showProviderDetail(name) {
+  const panel = document.getElementById('provider-detail');
+  document.getElementById('provider-detail-id').textContent = name;
+  panel.classList.add('active');
+
+  document.querySelectorAll('#provider-table-body tr').forEach(tr => tr.classList.remove('selected'));
+  const row = document.querySelector(`#provider-table-body tr[data-name="${name}"]`);
+  if (row) {
+    row.classList.add('selected');
+    document.getElementById('provider-detail-url').value = row.dataset.baseurl || '';
+    document.getElementById('provider-detail-key').value = row.dataset.apikey || '';
+    document.getElementById('provider-detail-proxy').value = row.dataset.proxy || '';
+  }
+}
+
+function showOptDetail(id) {
+  const panel = document.getElementById('opt-detail');
+  document.getElementById('opt-detail-id').textContent = id;
+  panel.classList.add('active');
+
+  document.querySelectorAll('#opt-table-body tr').forEach(tr => tr.classList.remove('selected'));
+  const row = document.querySelector(`#opt-table-body tr[data-id="${id}"]`);
+  if (row) {
+    row.classList.add('selected');
+    document.getElementById('opt-detail-fields').value = row.dataset.fields || '';
+  }
+}
+
+function showModelmapDetail(name) {
+  const panel = document.getElementById('modelmap-detail');
+  document.getElementById('modelmap-detail-id').textContent = name;
+  panel.classList.add('active');
+
+  document.querySelectorAll('#modelmap-table-body tr').forEach(tr => tr.classList.remove('selected'));
+  const row = document.querySelector(`#modelmap-table-body tr[data-name="${name}"]`);
+  if (row) {
+    row.classList.add('selected');
+    document.getElementById('modelmap-detail-name').value = row.dataset.name || '';
+    document.getElementById('modelmap-detail-value').value = row.dataset.value || '';
+  }
+}
+
+function showAddForm() {
+  // Clear and show detail panel for adding
+  switch(currentSection) {
+    case 'llm':
+      document.getElementById('llm-detail-id').textContent = '新增';
+      document.getElementById('llm-detail-provider').value = '';
+      document.getElementById('llm-detail-model').value = '';
+      document.getElementById('llm-detail-cd').value = '60';
+      document.getElementById('llm-detail').classList.add('active');
+      break;
+    case 'code':
+      document.getElementById('code-detail-id').textContent = '新增';
+      document.getElementById('code-detail-provider').value = '';
+      document.getElementById('code-detail-model').value = '';
+      document.getElementById('code-detail-opt').value = '';
+      document.getElementById('code-detail').classList.add('active');
+      break;
+    case 'provider':
+      document.getElementById('provider-detail-id').textContent = '新 Provider';
+      document.getElementById('provider-detail-url').value = '';
+      document.getElementById('provider-detail-key').value = '';
+      document.getElementById('provider-detail-proxy').value = '';
+      document.getElementById('provider-detail').classList.add('active');
+      break;
+    case 'opt':
+      document.getElementById('opt-detail-id').textContent = '新增';
+      document.getElementById('opt-detail-fields').value = '';
+      document.getElementById('opt-detail').classList.add('active');
+      break;
+    case 'modelmap':
+      document.getElementById('modelmap-detail-id').textContent = '新映射';
+      document.getElementById('modelmap-detail-name').value = '';
+      document.getElementById('modelmap-detail-value').value = '';
+      document.getElementById('modelmap-detail').classList.add('active');
+      break;
+  }
+}
+
+// ===== Toast Notifications =====
+function showToast(message, type = 'success') {
+  const container = document.getElementById('toast-container');
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.innerHTML = `
+    <span class="toast-message">${message}</span>
+    <button class="toast-close" onclick="this.parentElement.remove()">×</button>
+  `;
+  container.appendChild(toast);
+
+  setTimeout(() => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateX(20px)';
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
+}
+
+// ===== API Functions =====
+async function apiCall(url, successMsg, errorMsg) {
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.ok) {
+      showToast(successMsg);
+      return true;
+    } else {
+      showToast(errorMsg + ': ' + (data.error || '未知错误'), 'error');
+      return false;
+    }
+  } catch (e) {
+    showToast(errorMsg + ': ' + e.message, 'error');
+    return false;
+  }
+}
+
+async function saveLlmDetail() {
+  let id = document.getElementById('llm-detail-id').textContent;
+  const provider = document.getElementById('llm-detail-provider').value;
+  const model = document.getElementById('llm-detail-model').value;
+  const cd = document.getElementById('llm-detail-cd').value || '60';
+
+  if (id === '新增') {
+    id = prompt('请输入配置编号 (01-20):');
+    if (!id || !id.match(/^\d{2}$/)) {
+      showToast('请输入有效的两位编号 (如 01, 05)', 'error');
+      return;
+    }
+  }
+
+  if (!provider || !model) {
+    showToast('请填写完整信息', 'error');
+    return;
+  }
+
+  const url = `/api/add-llm?num=${encodeURIComponent(id)}&provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}&cd=${encodeURIComponent(cd)}`;
+  if (await apiCall(url, 'LLM 配置已保存', '保存失败')) {
+    location.reload();
+  }
+}
+
+async function clearLlmDetailCd() {
+  const id = document.getElementById('llm-detail-id').textContent;
+  const url = `/api/clear-llm-cd?num=${encodeURIComponent(id)}`;
+  await apiCall(url, 'CD 已清除', '清除失败');
+}
+
+async function deleteLlmDetail() {
+  const id = document.getElementById('llm-detail-id').textContent;
+  if (!confirm(`确定删除 LLM 配置 ${id}？`)) return;
+
+  const url = `/api/del-llm?num=${encodeURIComponent(id)}`;
+  if (await apiCall(url, '配置已删除', '删除失败')) {
+    location.reload();
+  }
+}
+
+async function saveCodeDetail() {
+  let id = document.getElementById('code-detail-id').textContent;
+  const provider = document.getElementById('code-detail-provider').value;
+  const model = document.getElementById('code-detail-model').value;
+  const opt = document.getElementById('code-detail-opt').value || '';
+
+  if (id === '新增') {
+    id = prompt('请输入配置编号 (01-20):');
+    if (!id || !id.match(/^\d{2}$/)) {
+      showToast('请输入有效的两位编号 (如 01, 05)', 'error');
+      return;
+    }
+  }
+
+  if (!provider || !model) {
+    showToast('请填写完整信息', 'error');
+    return;
+  }
+
+  const url = `/api/add-code?num=${encodeURIComponent(id)}&provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}&opt=${encodeURIComponent(opt)}`;
+  if (await apiCall(url, 'Code 配置已保存', '保存失败')) {
+    location.reload();
+  }
+}
+
+async function clearCodeDetailCd() {
+  const id = document.getElementById('code-detail-id').textContent;
+  const url = `/api/clear-code-cd?num=${encodeURIComponent(id)}`;
+  await apiCall(url, 'CD 已清除', '清除失败');
+}
+
+async function deleteCodeDetail() {
+  const id = document.getElementById('code-detail-id').textContent;
+  if (!confirm(`确定删除 Code 配置 ${id}？`)) return;
+
+  const url = `/api/del-code?num=${encodeURIComponent(id)}`;
+  if (await apiCall(url, '配置已删除', '删除失败')) {
+    location.reload();
+  }
+}
+
+async function saveProviderDetail() {
+  let name = document.getElementById('provider-detail-id').textContent;
+  const baseurl = document.getElementById('provider-detail-url').value;
+  const apikey = document.getElementById('provider-detail-key').value;
+  const proxy = document.getElementById('provider-detail-proxy').value || '';
+
+  if (name === '新 Provider') {
+    name = prompt('请输入 Provider 名称:');
+    if (!name) {
+      showToast('请输入有效的 Provider 名称', 'error');
+      return;
+    }
+  }
+
+  if (!baseurl || !apikey) {
+    showToast('请填写 Base URL 和 API Key', 'error');
+    return;
+  }
+
+  const url = `/api/add-provider?name=${encodeURIComponent(name)}&baseurl=${encodeURIComponent(baseurl)}&apikey=${encodeURIComponent(apikey)}&proxy=${encodeURIComponent(proxy)}`;
+  if (await apiCall(url, 'Provider 已保存', '保存失败')) {
+    location.reload();
+  }
+}
+
+async function deleteProviderDetail() {
+  const name = document.getElementById('provider-detail-id').textContent;
+  if (!confirm(`确定删除 Provider "${name}"？`)) return;
+
+  const url = `/api/del-provider?name=${encodeURIComponent(name)}`;
+  if (await apiCall(url, 'Provider 已删除', '删除失败')) {
+    location.reload();
+  }
+}
+
+async function saveOptDetail() {
+  let id = document.getElementById('opt-detail-id').textContent;
+  const fieldsStr = document.getElementById('opt-detail-fields').value;
+
+  if (id === '新增') {
+    id = prompt('请输入 Opt 编号:');
+    if (!id) {
+      showToast('请输入有效的 Opt 编号', 'error');
+      return;
+    }
+  }
+
+  if (!fieldsStr) {
+    showToast('请填写配置项', 'error');
+    return;
+  }
+
+  // Parse key=value, key=value format
+  let url = `/api/save-opt?id=${encodeURIComponent(id)}`;
+  const pairs = fieldsStr.split(',').map(p => p.trim()).filter(p => p);
+  for (const pair of pairs) {
+    const [key, value] = pair.split('=').map(s => s.trim());
+    if (key && value !== undefined) {
+      url += `&${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+    }
+  }
+
+  if (await apiCall(url, 'Opt 配置已保存', '保存失败')) {
+    location.reload();
+  }
+}
+
+async function deleteOptDetail() {
+  const id = document.getElementById('opt-detail-id').textContent;
+  if (!confirm(`确定删除 Opt 配置 ${id}？`)) return;
+
+  const url = `/api/del-opt?id=${encodeURIComponent(id)}`;
+  if (await apiCall(url, 'Opt 已删除', '删除失败')) {
+    location.reload();
+  }
+}
+
+async function saveModelmapDetail() {
+  let name = document.getElementById('modelmap-detail-name').value;
+  const value = document.getElementById('modelmap-detail-value').value;
+
+  if (!name || !value) {
+    showToast('请填写模型名和映射值', 'error');
+    return;
+  }
+
+  const url = `/api/add-modelmap?name=${encodeURIComponent(name)}&value=${encodeURIComponent(value)}`;
+  if (await apiCall(url, 'ModelMap 已保存', '保存失败')) {
+    location.reload();
+  }
+}
+
+async function deleteModelmapDetail() {
+  const name = document.getElementById('modelmap-detail-id').textContent;
+  if (!confirm(`确定删除映射 "${name}"？`)) return;
+
+  const url = `/api/del-modelmap?name=${encodeURIComponent(name)}`;
+  if (await apiCall(url, '映射已删除', '删除失败')) {
+    location.reload();
+  }
+}
+
+async function resetAllStats() {
+  if (!confirm('确定重置所有统计？此操作不可恢复。')) return;
+
+  const url = `/api/reset-stats`;
+  await apiCall(url, '统计已重置', '重置失败');
+}
+
+// ===== Export Config =====
+async function exportConfig() {
+  if (!confirm('确定导出当前配置到 config.lua 文件？\n\n这将覆盖现有文件（原文件会备份为 config.lua.bak）。')) {
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/export-config');
+    const data = await res.json();
+
+    if (data.ok) {
+      showToast('配置已导出到 config.lua', 'success');
+
+      // 询问是否预览
+      if (confirm('配置已导出成功！\n\n是否在新窗口预览文件内容？')) {
+        window.open('/api/preview-config', '_blank');
+      }
+    } else {
+      showToast('导出失败: ' + (data.error || '未知错误'), 'error');
+    }
+  } catch (e) {
+    showToast('导出失败: ' + e.message, 'error');
+  }
+}
+
+// ===== Filter Functions =====
+function filterLlm() {
+  const search = document.getElementById('llm-search').value.toLowerCase();
+  const provider = document.getElementById('llm-filter-provider').value;
+
+  document.querySelectorAll('#llm-table-body tr').forEach(row => {
+    const model = row.querySelector('.model')?.textContent.toLowerCase() || '';
+    const prov = row.querySelector('.provider')?.textContent || '';
+
+    const matchSearch = !search || model.includes(search);
+    const matchProvider = !provider || prov === provider;
+
+    row.style.display = matchSearch && matchProvider ? '' : 'none';
+  });
+}
+
+function filterCode() {
+  const search = document.getElementById('code-search').value.toLowerCase();
+
+  document.querySelectorAll('#code-table-body tr').forEach(row => {
+    const model = row.querySelector('.model')?.textContent.toLowerCase() || '';
+    row.style.display = !search || model.includes(search) ? '' : 'none';
+  });
+}
+
+function filterModelmap() {
+  const search = document.getElementById('modelmap-search').value.toLowerCase();
+
+  document.querySelectorAll('#modelmap-table-body tr').forEach(row => {
+    const name = row.querySelector('td')?.textContent.toLowerCase() || '';
+    row.style.display = !search || name.includes(search) ? '' : 'none';
+  });
+}
+</script>
+
+</body>
+</html>
