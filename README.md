@@ -11,10 +11,6 @@ A unified reverse proxy for multiple LLM providers with intelligent load balanci
 - **Hot Reload** - Update Lua routing logic without restart
 - **Redis Configuration** - Dynamic configuration at runtime
 
-## Demo
-
-![Running Dashboard](docs/demo-effect.png)
-
 ## Architecture
 
 ```
