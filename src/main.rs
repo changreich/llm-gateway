@@ -8,6 +8,8 @@
 
 mod anthropic_convert;
 mod sse_stream;
+mod tls_server;
+mod ssl;
 use anthropic_convert::{
     extract_error_message, extract_openai_fields, transform_anthropic_request_to_openai,
     transform_openai_to_anthropic, convert_openai_content_to_anthropic,
@@ -38,6 +40,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+/// 从 listen 字符串解析端口号
+fn parse_port(listen: &str) -> u16 {
+    listen.rsplit(':').next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9090)
+}
+
 /// 模型统计数据
 #[derive(Clone, Debug, Default)]
 struct ModelStats {
@@ -63,6 +72,28 @@ static CODE_STATS_TOTAL_COMPLETION: AtomicU64 = AtomicU64::new(0);
 static CODE_STATS_MODELS: Lazy<RwLock<HashMap<String, ModelStats>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 static CODE_STATS_SELECTED: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("01".to_string()));
 static CODE_STATS_CONFIG: Lazy<RwLock<HashMap<String, (String, String)>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// 端口配置 (用于统计页面显示)
+static LLM_PORT: AtomicU64 = AtomicU64::new(9090);
+static CODE_PORT: AtomicU64 = AtomicU64::new(9089);
+
+/// 端口配置字符串 (从 config.lua 读取)
+static LLM_LISTEN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("0.0.0.0:9090".to_string()));
+static CODE_LISTEN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("0.0.0.0:9089".to_string()));
+static ADMIN_LISTEN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("0.0.0.0:9093".to_string()));
+static STATS_LISTEN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("0.0.0.0:9091".to_string()));
+
+/// TLS 配置 (从 config.lua 读取)
+static TLS_ENABLED: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
+static TLS_CERT: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
+static TLS_KEY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
+static TLS_LISTEN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("0.0.0.0:443".to_string()));
+
+/// Code 端口配置 (router2.lua 处理)
+/// code_tls: TLS 端口 (443)
+/// code_http: HTTP 端口 (9443)
+static CODE_TLS_LISTEN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("0.0.0.0:443".to_string()));
+static CODE_HTTP_LISTEN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("0.0.0.0:9443".to_string()));
 
 /// 简单的 Redis 连接池
 struct RedisConnPool {
@@ -291,6 +322,20 @@ impl LuaRuntime {
             Ok(result == 1)
         }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_expire: {}", e)))?;
         globals.set("redis_expire", redis_expire_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set redis_expire: {}", e)))?;
+
+        // redis_del(key) -> bool
+        let redis_del_fn = lua.create_function(|_lua, key: String| {
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => return Ok(false),
+            };
+            let result: i64 = redis::cmd("DEL")
+                .arg(&key)
+                .query::<i64>(&mut conn)
+                .unwrap_or(0);
+            Ok(result > 0)
+        }).map_err(|e| Error::explain(ErrorType::InternalError, format!("create redis_del: {}", e)))?;
+        globals.set("redis_del", redis_del_fn).map_err(|e| Error::explain(ErrorType::InternalError, format!("set redis_del: {}", e)))?;
 
         // redis_lpush(key, value) -> bool
         let redis_lpush_fn = lua.create_function(|_lua, (key, value): (String, String)| {
@@ -904,7 +949,11 @@ fn lua_to_json(val: &mlua::Value) -> serde_json::Value {
 
 /// 生成 /running 页面 HTML（从 Rust 全局缓存读取，无阻塞）
 fn generate_running_html() -> String {
-    // LLM 统计 (9090 端口)
+    // 读取端口配置
+    let llm_port = LLM_PORT.load(Ordering::Relaxed) as u16;
+    let code_port = CODE_PORT.load(Ordering::Relaxed) as u16;
+
+    // LLM 统计
     let llm_calls = STATS_TOTAL_CALLS.load(Ordering::Relaxed);
     let llm_prompt = STATS_TOTAL_PROMPT.load(Ordering::Relaxed);
     let llm_completion = STATS_TOTAL_COMPLETION.load(Ordering::Relaxed);
@@ -938,7 +987,7 @@ fn generate_running_html() -> String {
         llm_rows = "<tr><td colspan=\"7\" style=\"color:#999;text-align:center\">暂无数据</td></tr>".to_string();
     }
 
-    // Code 统计 (9089 端口)
+    // Code 统计
     let code_calls = CODE_STATS_TOTAL_CALLS.load(Ordering::Relaxed);
     let code_prompt = CODE_STATS_TOTAL_PROMPT.load(Ordering::Relaxed);
     let code_completion = CODE_STATS_TOTAL_COMPLETION.load(Ordering::Relaxed);
@@ -974,10 +1023,48 @@ fn generate_running_html() -> String {
 
     format!(r#"<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>LLM Gateway</title>
-<style>body{{font-family:sans-serif;max-width:1000px;margin:40px auto;padding:20px;background:#f5f5f5}}h1{{color:#333;border-bottom:2px solid #4CAF50;padding-bottom:10px}}h2{{color:#555;margin-top:25px;font-size:1.1em}}.card{{background:white;border-radius:8px;padding:20px;margin:15px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}.stat-box{{display:inline-block;background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:10px 16px;border-radius:8px;margin:4px;text-align:center;font-size:0.9em}}.stat-box .v{{font-size:1.3em;font-weight:bold}}.stat-box .l{{font-size:0.7em;opacity:0.9}}.stat-box.green{{background:linear-gradient(135deg,#11998e,#38ef7d)}}.stat-box.orange{{background:linear-gradient(135deg,#f093fb,#f5576c)}}.stat-box.blue{{background:linear-gradient(135deg,#4facfe,#00f2fe)}}.port-label{{font-size:0.75em;color:#888;background:#eee;padding:2px 6px;border-radius:4px;margin-left:8px}}table{{width:100%;border-collapse:collapse;font-size:0.9em}}th,td{{text-align:left;padding:8px;border-bottom:1px solid #eee}}th{{background:#f9f9f9;font-weight:600}}.num{{font-family:monospace;background:#e3f2fd;padding:2px 6px;border-radius:4px}}.provider{{color:#1976d2;font-weight:500}}.selected{{background:#fff3e0}}.prompt{{color:#4CAF50}}.completion{{color:#2196F3}}.section-header{{display:flex;align-items:center;margin-bottom:10px}}</style>
-</head><body><h1>LLM Gateway</h1>
+<style>
+:root{{--bg:#f5f5f5;--card:#fff;--text:#333;--text2:#666;--border:#eee}}
+.dark{{--bg:#1a1a2e;--card:#16213e;--text:#e8e8e8;--text2:#a0a0a0;--border:#2a2a4a}}
+body{{font-family:sans-serif;max-width:1000px;margin:40px auto;padding:20px;background:var(--bg);color:var(--text);transition:background .3s,color .3s}}
+h1{{color:var(--text);border-bottom:2px solid #4CAF50;padding-bottom:10px}}
+h2{{color:var(--text);margin-top:25px;font-size:1.1em}}
+.card{{background:var(--card);border-radius:8px;padding:20px;margin:15px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1);transition:background .3s}}
+.stat-box{{display:inline-block;background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:10px 16px;border-radius:8px;margin:4px;text-align:center;font-size:0.9em}}
+.stat-box .v{{font-size:1.3em;font-weight:bold}}
+.stat-box .l{{font-size:0.7em;opacity:0.9}}
+.stat-box.green{{background:linear-gradient(135deg,#11998e,#38ef7d)}}
+.stat-box.orange{{background:linear-gradient(135deg,#f093fb,#f5576c)}}
+.stat-box.blue{{background:linear-gradient(135deg,#4facfe,#00f2fe)}}
+.port-label{{font-size:0.75em;color:var(--text2);background:rgba(0,0,0,0.05);padding:2px 6px;border-radius:4px;margin-left:8px}}
+.dark .port-label{{background:rgba(255,255,255,0.1)}}
+table{{width:100%;border-collapse:collapse;font-size:0.9em}}
+th,td{{text-align:left;padding:8px;border-bottom:1px solid var(--border)}}
+th{{background:rgba(0,0,0,0.02);font-weight:600}}
+.dark th{{background:rgba(255,255,255,0.03)}}
+.num{{font-family:monospace;background:#e3f2fd;padding:2px 6px;border-radius:4px;color:#1976d2}}
+.dark .num{{background:#1e3a5f}}
+.provider{{color:#1976d2;font-weight:500}}
+.selected{{background:rgba(255,152,0,0.15)}}
+.prompt{{color:#4CAF50}}
+.completion{{color:#2196F3}}
+.section-header{{display:flex;align-items:center;margin-bottom:10px}}
+.theme-toggle{{position:fixed;top:15px;right:20px;display:flex;align-items:center;gap:8px;font-size:0.85em;z-index:100}}
+.theme-toggle input{{width:40px;height:20px;appearance:none;background:#ccc;border-radius:10px;cursor:pointer;position:relative}}
+.theme-toggle input::before{{content:'';position:absolute;left:2px;top:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .3s}}
+.theme-toggle input:checked{{background:#1890ff}}
+.theme-toggle input:checked::before{{transform:translateX(20px)}}
+a{{color:#1890ff}}
+</style>
+<script>
+function toggleTheme(){{document.documentElement.classList.toggle('dark');localStorage.setItem('theme',document.documentElement.classList.contains('dark')?'dark':'light')}}
+(function(){{if(localStorage.getItem('theme')==='dark')document.documentElement.classList.add('dark')}})();
+</script>
+</head><body>
+<div class="theme-toggle"><span>☀️</span><input type="checkbox" onchange="toggleTheme()"><span>🌙</span></div>
+<h1>LLM Gateway</h1>
 <div class="card">
-<div class="section-header"><h2>LLM 模型统计</h2><span class="port-label">端口 9090</span></div>
+<div class="section-header"><h2>LLM 模型统计</h2><span class="port-label">端口 {}</span></div>
 <div class="stat-box"><div class="v">{}</div><div class="l">调用</div></div>
 <div class="stat-box green"><div class="v">{}</div><div class="l">Prompt</div></div>
 <div class="stat-box orange"><div class="v">{}</div><div class="l">Completion</div></div>
@@ -986,7 +1073,7 @@ fn generate_running_html() -> String {
 {}</table>
 </div>
 <div class="card">
-<div class="section-header"><h2>Code 模型统计</h2><span class="port-label">端口 9089</span></div>
+<div class="section-header"><h2>Code 模型统计</h2><span class="port-label">端口 {}</span></div>
 <div class="stat-box blue"><div class="v">{}</div><div class="l">调用</div></div>
 <div class="stat-box green"><div class="v">{}</div><div class="l">Prompt</div></div>
 <div class="stat-box orange"><div class="v">{}</div><div class="l">Completion</div></div>
@@ -995,7 +1082,7 @@ fn generate_running_html() -> String {
 {}</table>
 </div>
 <p style="color:#999;text-align:center;margin-top:20px;font-size:0.85em">LLM Gateway | <a href="/debug">debug</a> | <a href="/config">config</a> | <a href="/raw">raw</a></p>
-</body></html>"#, llm_calls, llm_prompt, llm_completion, llm_rows, code_calls, code_prompt, code_completion, code_rows)
+</body></html>"#, llm_port, llm_calls, llm_prompt, llm_completion, llm_rows, code_port, code_calls, code_prompt, code_completion, code_rows)
 }
 
 #[derive(Clone, Default, Debug)]
@@ -1065,11 +1152,12 @@ impl Default for GatewayCtx {
 struct LuaGateway {
     lua: Arc<RwLock<LuaRuntime>>,
     port: u16,
+    transform: bool,  // 是否执行 A→OpenAI 转换
 }
 
 impl LuaGateway {
-    fn new(lua: Arc<RwLock<LuaRuntime>>, port: u16) -> Self {
-        Self { lua, port }
+    fn new(lua: Arc<RwLock<LuaRuntime>>, port: u16, transform: bool) -> Self {
+        Self { lua, port, transform }
     }
 }
 
@@ -1083,7 +1171,10 @@ impl ProxyHttp for LuaGateway {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let method = session.req_header().method.as_str().to_string();
-        let path = session.req_header().uri.path().to_string();
+        // 获取完整路径（包含查询参数）
+        let path = session.req_header().uri.path_and_query()
+            .map(|pq| pq.to_string())
+            .unwrap_or_else(|| session.req_header().uri.path().to_string());
         info!("Processing: {} {}", method, path);
 
         // /running 端点：直接在 Rust 中处理，完全绕过 Lua（避免被其他请求阻塞）
@@ -1181,7 +1272,7 @@ impl ProxyHttp for LuaGateway {
                 // 构建请求体：9089 端口根据 need_transform 决定是否转换
                 info!("[port:{}] need_transform={}, upstream={}", self.port, decision.need_transform, decision.upstream);
                 let request_body = if !decision.new_request_body.is_empty() {
-                    if self.port == 9089 && stream_requested {
+                    if self.transform && stream_requested {
                         if decision.need_transform {
                             // A→OpenAI 转换：注入 stream:true
                             match inject_stream_true(&decision.new_request_body) {
@@ -1195,7 +1286,7 @@ impl ProxyHttp for LuaGateway {
                     } else {
                         decision.new_request_body.clone()
                     }
-                } else if self.port == 9089 {
+                } else if self.transform {
                     if decision.need_transform {
                         // 无 Lua 返回体 + 需要转换：Rust 层兜底转换
                         match transform_anthropic_request_to_openai(
@@ -1258,7 +1349,7 @@ impl ProxyHttp for LuaGateway {
                 // ============================================================
                 // 9089 端口 + 流式请求：根据 need_transform 决定是否转换
                 // ============================================================
-                if self.port == 9089 && stream_requested && decision.need_transform {
+                if self.transform && stream_requested && decision.need_transform {
                     // A→OpenAI 流式转换路径
                     // 注册 SSE 连接
                     let client_req_id = serde_json::from_slice::<serde_json::Value>(&ctx.request_body)
@@ -1410,7 +1501,7 @@ impl ProxyHttp for LuaGateway {
                 // ============================================================
                 // 9089 端口 + 流式请求 + 不需要转换：直接透传 SSE 流
                 // ============================================================
-                if self.port == 9089 && stream_requested && !decision.need_transform {
+                if self.transform && stream_requested && !decision.need_transform {
                     info!("[port:{}] A→A passthrough SSE stream", self.port);
 
                     let response = req.send().await
@@ -1506,7 +1597,7 @@ impl ProxyHttp for LuaGateway {
 
                 info!("Upstream response: status={}", status);
 
-                let final_response_body = if self.port == 9089 && decision.need_transform {
+                let final_response_body = if self.transform && decision.need_transform {
                     let lua = self.lua.read().unwrap();
 
                     match extract_openai_fields(&response_body) {
@@ -1656,6 +1747,136 @@ fn preload_config(config_path: &PathBuf) {
         }
     };
 
+    // 解析端口配置 (优先级: 环境变量 > config.lua > 默认值)
+    if let Ok(listen) = config_table.get::<Table>("listen") {
+        // LLM 端口
+        if std::env::var("LLM_LISTEN").is_err() {
+            if let Ok(llm) = listen.get::<String>("llm") {
+                if let Ok(mut guard) = LLM_LISTEN.write() {
+                    *guard = llm.clone();
+                    info!("Set LLM_LISTEN from config: {}", llm);
+                }
+            }
+        }
+        // Code 端口
+        if std::env::var("LLM_LISTEN_2").is_err() {
+            if let Ok(code) = listen.get::<String>("code") {
+                if let Ok(mut guard) = CODE_LISTEN.write() {
+                    *guard = code.clone();
+                    info!("Set CODE_LISTEN from config: {}", code);
+                }
+            }
+        }
+        // Admin 端口
+        if std::env::var("LLM_LISTEN_3").is_err() {
+            if let Ok(admin) = listen.get::<String>("admin") {
+                if let Ok(mut guard) = ADMIN_LISTEN.write() {
+                    *guard = admin.clone();
+                    info!("Set ADMIN_LISTEN from config: {}", admin);
+                }
+            }
+        }
+        // Stats 端口
+        if std::env::var("LLM_STATS_LISTEN").is_err() {
+            if let Ok(stats) = listen.get::<String>("stats") {
+                if let Ok(mut guard) = STATS_LISTEN.write() {
+                    *guard = stats.clone();
+                    info!("Set STATS_LISTEN from config: {}", stats);
+                }
+            }
+        }
+    }
+
+    // 解析 TLS 配置 (优先级: 环境变量 > config.lua)
+    if let Ok(tls) = config_table.get::<Table>("tls") {
+        // TLS 启用状态
+        if std::env::var("LLM_TLS_ENABLED").is_err() {
+            if let Ok(enabled) = tls.get::<bool>("enabled") {
+                if let Ok(mut guard) = TLS_ENABLED.write() {
+                    *guard = enabled;
+                    info!("Set TLS_ENABLED from config: {}", enabled);
+                }
+            }
+        }
+        // 证书路径
+        if std::env::var("LLM_TLS_CERT").is_err() {
+            if let Ok(cert) = tls.get::<String>("cert") {
+                if let Ok(mut guard) = TLS_CERT.write() {
+                    *guard = cert.clone();
+                    info!("Set TLS_CERT from config: {}", cert);
+                }
+            }
+        }
+        // 私钥路径
+        if std::env::var("LLM_TLS_KEY").is_err() {
+            if let Ok(key) = tls.get::<String>("key") {
+                if let Ok(mut guard) = TLS_KEY.write() {
+                    *guard = key.clone();
+                    info!("Set TLS_KEY from config: {}", key);
+                }
+            }
+        }
+        // TLS 监听地址 (兼容旧配置)
+        if std::env::var("LLM_TLS_LISTEN").is_err() {
+            if let Ok(tls_listen) = tls.get::<String>("listen") {
+                if let Ok(mut guard) = TLS_LISTEN.write() {
+                    *guard = tls_listen.clone();
+                    info!("Set TLS_LISTEN from config: {}", tls_listen);
+                }
+            }
+        }
+    }
+
+    // 解析 Code 端口配置 (router2.lua 处理)
+    // code_tls: TLS 端口 (443)
+    // code_http: HTTP 端口 (9443)
+    if std::env::var("LLM_CODE_TLS_LISTEN").is_err() {
+        if let Ok(code_tls) = config_table.get::<String>("code_tls") {
+            if let Ok(mut guard) = CODE_TLS_LISTEN.write() {
+                *guard = code_tls.clone();
+                info!("Set CODE_TLS_LISTEN from config: {}", code_tls);
+            }
+            // 同时更新 TLS_LISTEN (兼容)
+            if let Ok(mut guard) = TLS_LISTEN.write() {
+                *guard = code_tls.clone();
+            }
+        }
+    }
+    if std::env::var("LLM_CODE_HTTP_LISTEN").is_err() {
+        if let Ok(code_http) = config_table.get::<String>("code_http") {
+            if let Ok(mut guard) = CODE_HTTP_LISTEN.write() {
+                *guard = code_http.clone();
+                info!("Set CODE_HTTP_LISTEN from config: {}", code_http);
+            }
+        }
+    }
+
+    // 环境变量覆盖 TLS 配置
+    if let Ok(enabled) = std::env::var("LLM_TLS_ENABLED") {
+        if let Ok(mut guard) = TLS_ENABLED.write() {
+            *guard = enabled == "true" || enabled == "1";
+            info!("Set TLS_ENABLED from env: {}", enabled);
+        }
+    }
+    if let Ok(cert) = std::env::var("LLM_TLS_CERT") {
+        if let Ok(mut guard) = TLS_CERT.write() {
+            *guard = cert.clone();
+            info!("Set TLS_CERT from env");
+        }
+    }
+    if let Ok(key) = std::env::var("LLM_TLS_KEY") {
+        if let Ok(mut guard) = TLS_KEY.write() {
+            *guard = key.clone();
+            info!("Set TLS_KEY from env");
+        }
+    }
+    if let Ok(tls_listen) = std::env::var("LLM_TLS_LISTEN") {
+        if let Ok(mut guard) = TLS_LISTEN.write() {
+            *guard = tls_listen.clone();
+            info!("Set TLS_LISTEN from env: {}", tls_listen);
+        }
+    }
+
     let mut conn = match get_redis_conn() {
         Some(c) => c,
         None => {
@@ -1768,11 +1989,187 @@ fn spawn_file_watcher(lua: Arc<RwLock<LuaRuntime>>, script_path: PathBuf) -> Rec
     watcher
 }
 
+/// TLS 错误记录到 Redis 的 key
+static TLS_ERROR_KEY: &str = "llm:tls_errors";
+
+/// 自定义日志写入器，检测 TLS 握手错误并写入 Redis
+struct TlsAwareLogWriter {
+    inner: std::fs::File,
+}
+
+impl TlsAwareLogWriter {
+    fn new(file: std::fs::File) -> Self {
+        Self { inner: file }
+    }
+
+    /// 检查日志内容是否是 TLS 握手错误，如果是则写入 Redis
+    fn check_and_log_tls_error(&self, content: &str) {
+        // 检测 TLS 握手失败的错误
+        if content.contains("Downstream handshake error") ||
+           content.contains("TLSHandshakeFailure") ||
+           content.contains("TLS accept() failed") {
+            // 提取客户端地址 (如果有)
+            let peer_info = if let Some(start) = content.find("from ") {
+                if let Some(end) = content[start..].find(':') {
+                    &content[start + 5..start + end]
+                } else {
+                    "unknown"
+                }
+            } else {
+                "unknown"
+            };
+
+            // 异步写入 Redis (使用 try_spawn 避免阻塞)
+            let error_msg = content.to_string();
+            let timestamp = chrono::Utc::now().to_rfc3339();
+
+            // 使用非阻塞方式尝试写入 Redis
+            if let Some(mut conn) = get_redis_conn() {
+                let full_entry = format!("{}|{}|{}", timestamp, peer_info, error_msg);
+                // 使用 RPUSH 添加到列表尾部，保留最近 100 条
+                let _: Result<(), _> = redis::cmd("RPUSH")
+                    .arg(TLS_ERROR_KEY)
+                    .arg(&full_entry)
+                    .query(&mut *conn);
+                // 限制列表长度为最近 100 条
+                let _: Result<(), _> = redis::cmd("LTRIM")
+                    .arg(TLS_ERROR_KEY)
+                    .arg(-100i64)
+                    .arg(-1i64)
+                    .query(&mut *conn);
+                info!("TLS error logged to Redis: {}", peer_info);
+            }
+        }
+    }
+}
+
+impl std::io::Write for TlsAwareLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // 先写入文件
+        let result = self.inner.write(buf);
+
+        // 检查是否是 TLS 错误
+        if let Ok(s) = std::str::from_utf8(buf) {
+            self.check_and_log_tls_error(s);
+        }
+
+        result
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// 检查端口是否可用
+fn check_port_available(addr: &str) -> Result<(), String> {
+    use std::net::TcpListener;
+
+    // 解析地址
+    let socket_addr: std::net::SocketAddr = addr.parse()
+        .map_err(|e| format!("Invalid address '{}': {}", addr, e))?;
+
+    // 尝试绑定端口
+    match TcpListener::bind(socket_addr) {
+        Ok(listener) => {
+            // 成功绑定后立即释放
+            drop(listener);
+            Ok(())
+        }
+        Err(e) => {
+            Err(format!("Port {} is not available: {}", addr, e))
+        }
+    }
+}
+
+/// 检查所有服务端口是否可用
+fn check_all_ports_available() -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    // 主服务端口 (9090)
+    let listen = std::env::var("LLM_LISTEN").unwrap_or_else(|_| {
+        LLM_LISTEN.read().unwrap().clone()
+    });
+    if let Err(e) = check_port_available(&listen) {
+        errors.push(format!("Main service ({}): {}", listen, e));
+    }
+
+    // Code HTTP 端口 (9443)
+    let code_http_listen = std::env::var("LLM_CODE_HTTP_LISTEN").unwrap_or_else(|_| {
+        CODE_HTTP_LISTEN.read().unwrap().clone()
+    });
+    if let Err(e) = check_port_available(&code_http_listen) {
+        errors.push(format!("Code HTTP ({}): {}", code_http_listen, e));
+    }
+
+    // Code TLS 端口 (443) - 仅在 TLS 启用时检查
+    let tls_enabled = std::env::var("LLM_TLS_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or_else(|_| {
+            TLS_ENABLED.read().map(|g| *g).unwrap_or(false)
+        });
+    if tls_enabled {
+        let code_tls_listen = std::env::var("LLM_CODE_TLS_LISTEN").unwrap_or_else(|_| {
+            CODE_TLS_LISTEN.read().unwrap().clone()
+        });
+        if let Err(e) = check_port_available(&code_tls_listen) {
+            errors.push(format!("Code TLS ({}): {}", code_tls_listen, e));
+        }
+    }
+
+    // Admin Console 端口 (9093)
+    let listen3 = std::env::var("LLM_ADMIN_LISTEN").unwrap_or_else(|_| {
+        ADMIN_LISTEN.read().unwrap().clone()
+    });
+    if let Err(e) = check_port_available(&listen3) {
+        errors.push(format!("Admin Console ({}): {}", listen3, e));
+    }
+
+    // Stats 端口 (9091)
+    let stats_listen = std::env::var("LLM_STATS_LISTEN").unwrap_or_else(|_| {
+        STATS_LISTEN.read().unwrap().clone()
+    });
+    if let Err(e) = check_port_available(&stats_listen) {
+        errors.push(format!("Stats server ({}): {}", stats_listen, e));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("\n  - {}", errors.join("\n  - ")))
+    }
+}
+
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 初始化 rustls 加密后端 (ring)
+    // rustls 0.23+ 需要显式安装 CryptoProvider
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
+    // 日志输出到文件 (gateway.log)
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("gateway.log")
+        .expect("Failed to open gateway.log");
+    let tls_aware_writer = TlsAwareLogWriter::new(log_file);
+    let log_file_box: Box<dyn std::io::Write + Send> = Box::new(tls_aware_writer);
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(log_file_box))
+        .format(|buf, record| {
+            use std::io::Write;
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            writeln!(buf, "[{} {}:{}] {}", record.level(), record.target(), record.line().unwrap_or(0), record.args())
+        })
+        .init();
 
     // 使用环境变量或默认值配置
-    let listen = std::env::var("LLM_LISTEN").unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+    // 注意：preload_config 会先设置全局端口变量，环境变量优先级最高
+    let listen = std::env::var("LLM_LISTEN").unwrap_or_else(|_| {
+        LLM_LISTEN.read().unwrap().clone()
+    });
     let script = std::env::var("LLM_SCRIPT").unwrap_or_else(|_| "lua/router.lua".to_string());
 
     // 解析脚本路径：
@@ -1813,6 +2210,14 @@ fn main() {
 
     preload_config(&config_path);
 
+    // 检查所有端口是否可用
+    if let Err(e) = check_all_ports_available() {
+        eprintln!("FATAL: Port check failed:{}", e);
+        eprintln!("Please ensure all required ports are available and not in use by other processes.");
+        std::process::exit(1);
+    }
+    info!("All ports are available");
+
     let lua_runtime = match LuaRuntime::new(script_path.clone()) {
         Ok(rt) => Arc::new(RwLock::new(rt)),
         Err(e) => {
@@ -1823,8 +2228,7 @@ fn main() {
 
     let _watcher = spawn_file_watcher(lua_runtime.clone(), script_path.clone());
 
-    // 第二个 Lua 运行时 (端口 9089)
-    let listen2 = std::env::var("LLM_LISTEN_2").unwrap_or_else(|_| "0.0.0.0:9089".to_string());
+    // 第二个 Lua 运行时 (router2.lua - 用于 Code 端口)
     let script2 = std::env::var("LLM_SCRIPT_2").unwrap_or_else(|_| "router2.lua".to_string());
     let script_path2 = if PathBuf::from(&script2).is_absolute() {
         PathBuf::from(&script2)
@@ -1842,26 +2246,122 @@ fn main() {
     };
     let _watcher2 = spawn_file_watcher(lua_runtime2.clone(), script_path2);
 
+    // 第三个 Lua 运行时 (端口 9093 - Admin Console)
+    let listen3 = std::env::var("LLM_LISTEN_3").unwrap_or_else(|_| {
+        ADMIN_LISTEN.read().unwrap().clone()
+    });
+    let script3 = std::env::var("LLM_SCRIPT_3").unwrap_or_else(|_| "admin.lua".to_string());
+    let script_path3 = if PathBuf::from(&script3).is_absolute() {
+        PathBuf::from(&script3)
+    } else {
+        script_path.parent().map(|p| p.join(&script3)).unwrap_or_else(|| PathBuf::from(&script3))
+    };
+    info!("Script3: {:?}", script_path3);
+
+    let lua_runtime3 = match LuaRuntime::new(script_path3.clone()) {
+        Ok(rt) => Arc::new(RwLock::new(rt)),
+        Err(e) => {
+            error!("Lua3 init failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let _watcher3 = spawn_file_watcher(lua_runtime3.clone(), script_path3);
+
     let opt = Opt::parse_args();
     let mut server = Server::new(Some(opt)).unwrap();
     server.bootstrap();
 
+    // 解析端口号
+    let port1 = parse_port(&listen);
+    let port3 = parse_port(&listen3);
+
+    // 解析转换模式标志 (默认启用，向后兼容)
+    let code_transform = std::env::var("LLM_CODE_TRANSFORM")
+        .map(|v| v == "true")
+        .unwrap_or(true);
+
+    // 设置端口全局变量 (用于统计页面显示)
+    LLM_PORT.store(port1 as u64, Ordering::Relaxed);
+    // CODE_PORT 使用 HTTP 端口 (9443)
+    let code_http_port = parse_port(&std::env::var("LLM_CODE_HTTP_LISTEN").unwrap_or_else(|_| {
+        CODE_HTTP_LISTEN.read().unwrap().clone()
+    }));
+    CODE_PORT.store(code_http_port as u64, Ordering::Relaxed);
+
+    // 初始化 TLS 管理器 (优先级: 环境变量 > config.lua)
+    let tls_enabled = TLS_ENABLED.read().map(|g| *g).unwrap_or(false);
+    let tls_cert = TLS_CERT.read().map(|g| g.clone()).unwrap_or_default();
+    let tls_key = TLS_KEY.read().map(|g| g.clone()).unwrap_or_default();
+
+    // Code 端口配置 (router2.lua 处理)
+    let code_tls_listen = std::env::var("LLM_CODE_TLS_LISTEN").unwrap_or_else(|_| {
+        CODE_TLS_LISTEN.read().unwrap().clone()
+    });
+    let code_http_listen = std::env::var("LLM_CODE_HTTP_LISTEN").unwrap_or_else(|_| {
+        CODE_HTTP_LISTEN.read().unwrap().clone()
+    });
+
+    let ssl_manager: Option<ssl::SslManager> = if tls_enabled && !tls_cert.is_empty() && !tls_key.is_empty() {
+        match ssl::SslManager::new(ssl::TlsConfig::new(&tls_cert, &tls_key)) {
+            Ok(manager) => {
+                info!("TLS configured: cert={}, key={}", tls_cert, tls_key);
+                Some(manager)
+            }
+            Err(e) => {
+                error!("TLS config invalid: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("TLS not configured (enabled={}, cert={})", tls_enabled, tls_cert);
+        None
+    };
+
     // 主服务 (端口 9090)
-    let gateway = LuaGateway::new(lua_runtime, 9090);
+    let gateway = LuaGateway::new(lua_runtime, port1, false);
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, gateway);
     proxy_service.add_tcp(&listen);
     server.add_service(proxy_service);
-    info!("Listening on {} (router.lua)", listen);
+    info!("Listening on {} (router.lua, port={})", listen, port1);
 
-    // 第二服务 (端口 9089)
-    let gateway2 = LuaGateway::new(lua_runtime2, 9089);
-    let mut proxy_service2 = pingora_proxy::http_proxy_service(&server.configuration, gateway2);
-    proxy_service2.add_tcp(&listen2);
-    server.add_service(proxy_service2);
-    info!("Listening on {} (router2.lua)", listen2);
+    // Code HTTP 服务 (端口 9443，无 TLS)
+    // 注意：如果启用 TLS，HTTP 服务只绑定到 127.0.0.1，由独立 TLS 代理转发
+    let gateway_http = LuaGateway::new(lua_runtime2.clone(), code_http_port as u16, code_transform);
+    let mut proxy_service_http = pingora_proxy::http_proxy_service(&server.configuration, gateway_http);
+
+    // 保存 TLS 配置用于后续启动独立代理
+    let tls_proxy_config: Option<(String, String, String, String)> = if let Some(ref manager) = ssl_manager {
+        // TLS 模式：HTTP 服务只监听本地
+        let local_http_listen = format!("127.0.0.1:{}", code_http_port);
+        proxy_service_http.add_tcp(&local_http_listen);
+        info!("HTTP backend listening on {} (router2.lua, TLS mode)", local_http_listen);
+
+        // 返回 TLS 代理配置
+        Some((
+            manager.cert_path().to_string_lossy().to_string(),
+            manager.key_path().to_string_lossy().to_string(),
+            code_tls_listen.clone(),
+            local_http_listen,
+        ))
+    } else {
+        // 非 TLS 模式：HTTP 服务监听所有接口
+        proxy_service_http.add_tcp(&code_http_listen);
+        info!("Listening on {} (router2.lua HTTP, port={})", code_http_listen, code_http_port);
+        None
+    };
+    server.add_service(proxy_service_http);
+
+    // 第三服务 (端口 9093 - Admin Console)
+    let gateway3 = LuaGateway::new(lua_runtime3, port3, false);
+    let mut proxy_service3 = pingora_proxy::http_proxy_service(&server.configuration, gateway3);
+    proxy_service3.add_tcp(&listen3);
+    server.add_service(proxy_service3);
+    info!("Listening on {} (admin.lua, port={})", listen3, port3);
 
     // 启动独立的 stats HTTP 服务器 (9091 端口，完全绕过 Pingora/Lua)
-    let stats_listen = std::env::var("LLM_STATS_LISTEN").unwrap_or_else(|_| "0.0.0.0:9091".to_string());
+    let stats_listen = std::env::var("LLM_STATS_LISTEN").unwrap_or_else(|_| {
+        STATS_LISTEN.read().unwrap().clone()
+    });
     std::thread::spawn(move || {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -1905,5 +2405,20 @@ fn main() {
         }
     });
 
+    // 启动独立 TLS 代理 (Plan B: 避免 Pingora TLS 问题)
+    if let Some((cert_path, key_path, tls_listen, http_backend)) = tls_proxy_config {
+        info!("Starting standalone TLS proxy: {} -> {}", tls_listen, http_backend);
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for TLS proxy");
+            rt.block_on(async {
+                if let Err(e) = tls_server::start_tls_proxy(&tls_listen, &cert_path, &key_path, &http_backend).await {
+                    error!("TLS proxy error: {}", e);
+                }
+            });
+        });
+    }
+
     server.run_forever();
 }
+

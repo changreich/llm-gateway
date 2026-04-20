@@ -4,10 +4,10 @@ version = "0.1.2"
 edition = "2021"
 
 [dependencies]
-# Pingora
-pingora = { path = "../pingora-main/pingora" }
+# Pingora (启用 rustls TLS 支持)
+pingora = { path = "../pingora-main/pingora"}
 pingora-core = { path = "../pingora-main/pingora-core"}
-pingora-proxy = { path = "../pingora-main/pingora-proxy" }
+pingora-proxy = { path = "../pingora-main/pingora-proxy"}
 pingora-http = { path = "../pingora-main/pingora-http" }
 pingora-error = { path = "../pingora-main/pingora-error" }
 
@@ -26,7 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # HTTP client for OpenAI calls and upstream proxy
-reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "stream", "socks"] }
+reqwest = { version = "0.13", features = ["blocking", "json", "rustls", "stream", "socks"] }
 
 # Compression
 flate2 = "1"
@@ -39,3 +39,14 @@ notify = "6"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 once_cell = "1"
+chrono = "0.4"
+
+# TLS certificate generation (optional)
+rcgen = { version = "0.13", optional = true }
+rustls = { version = "0.23", features = ["ring"] }  # TLS 库 (需要显式初始化 CryptoProvider)
+rustls-pemfile = "2"  # PEM 文件解析
+tokio-rustls = "0.26"  # 异步 TLS
+
+[features]
+default = []
+test-cert = ["rcgen"]

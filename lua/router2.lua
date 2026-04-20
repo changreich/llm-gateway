@@ -88,10 +88,12 @@ local function init_config_to_redis()
         pcall(redis_set, "global:proxy", default_config.proxy)
     end
 
-    -- 写入 code 配置 (含 proxy)
+    -- 写入 code 配置 (含 protocol)
+    -- Redis 格式: provider|model|opt|protocol
     for num, cfg in pairs(default_code) do
         local key = "code:" .. num
-        local value = (cfg.provider or "") .. "|" .. (cfg.model or "") .. "|" .. (cfg.opt or "")
+        local protocol = cfg.protocol or "openai"  -- 默认 openai (需要转换)
+        local value = (cfg.provider or "") .. "|" .. (cfg.model or "") .. "|" .. (cfg.opt or "") .. "|" .. protocol
         pcall(redis_set, key, value)
         -- 写入 code 级代理配置
         if cfg.proxy then
@@ -187,6 +189,7 @@ local function safe_redis_incr(key)
 end
 
 -- 获取 code 配置
+-- Redis 格式: provider|model|opt|protocol
 local function get_code_config(num)
     local config = safe_redis_get("code:" .. num)
     if not config then
@@ -201,7 +204,8 @@ local function get_code_config(num)
     return {
         provider = parts[1],
         model = parts[2],
-        opt = parts[3] or ""
+        opt = parts[3] or "",
+        protocol = parts[4] or "openai"  -- 默认 openai (需要转换)
     }
 end
 
@@ -448,29 +452,6 @@ local function anthropic_content_to_openai(role, content, out_messages)
     return table.concat(text_parts, "\n"), tool_calls
 end
 
---- 判断 provider 是否需要 Anthropic→OpenAI 格式转换
--- provider 名称或 baseurl 包含 "anthropic" → 不需要转换，直接透传
--- @param provider_key string provider 名称 (如 "opengo", "anthropic")
--- @param baseurl string provider 的 baseurl
--- @return boolean true=需要转换, false=不需要转换
-local function needs_format_conversion(provider_key, baseurl)
-    -- 检查 provider 名称
-    if provider_key then
-        local lower_key = string.lower(provider_key)
-        if string.find(lower_key, "anthropic") then
-            return false  -- Anthropic provider 不需要转换
-        end
-    end
-    -- 检查 baseurl
-    if baseurl then
-        local lower_url = string.lower(baseurl)
-        if string.find(lower_url, "anthropic") then
-            return false  -- baseurl 含 anthropic，不需要转换
-        end
-    end
-    return true  -- 其他 provider 需要转换为 OpenAI 格式
-end
-
 --- 检测请求体格式
 -- @param body string 请求体 JSON 字符串
 -- @return string "anthropic" | "openai" | "unknown"
@@ -500,18 +481,18 @@ local function detect_request_format(body)
 end
 
 -- 重建请求体
-local function rebuild_request_body(original_body, model, opt_config, provider_sdk, provider_cfg, provider_key)
+local function rebuild_request_body(original_body, model, opt_config, provider_sdk, provider_cfg, protocol)
     -- 解析原请求体
     local ok, orig = pcall(json_decode, original_body)
     if not ok or type(orig) ~= "table" then
         return nil
     end
 
-    -- ★ Anthropic provider 直通：不做格式转换，只替换模型名和应用 opt
-    if not needs_format_conversion(provider_key, provider_cfg.baseurl) then
+    -- ★ Anthropic provider 直通：protocol="anthropic" 不做格式转换
+    if protocol == "anthropic" then
         local request_format = detect_request_format(original_body)
         pcall(redis_set, "code:debug_format",
-            string.format("skip_conversion:provider=%s req_format=%s", provider_key, request_format))
+            string.format("skip_conversion:protocol=%s req_format=%s", protocol, request_format))
         local passthrough = {}
         passthrough.model = model
         for k, v in pairs(orig) do
@@ -784,7 +765,7 @@ function handler.on_request(method, path, headers, body)
     pcall(redis_set, "code:debug", "loaded sdk:" .. tostring(provider_sdk))
 
     -- 重建请求体
-    local new_body = rebuild_request_body(body, code_cfg.model, opt_config, provider_sdk, provider_cfg, code_cfg.provider)
+    local new_body = rebuild_request_body(body, code_cfg.model, opt_config, provider_sdk, provider_cfg, code_cfg.protocol)
     if not new_body then
         return {
             action = "reject",
@@ -876,8 +857,8 @@ function handler.on_request(method, path, headers, body)
     -- 保存转换后的请求到 Redis (code:raw2)
     save_translated_request(new_body, selected, code_cfg.provider, code_cfg.model)
 
-    -- ★ 是否需要格式转换 (Anthropic provider 不需要)
-    local need_transform = needs_format_conversion(code_cfg.provider, provider_cfg.baseurl)
+    -- ★ 是否需要格式转换 (anthropic 协议不需要)
+    local need_transform = (code_cfg.protocol ~= "anthropic")
 
     -- ★ 获取代理配置
     local proxy_url = get_proxy_config(selected, code_cfg.provider)

@@ -31,3 +31,23 @@ test_*.py
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# IDE/工具
+.claude/
+.minimax/
+node_modules/
+package.json
+package-lock.json
+
+# 证书文件 (敏感)
+certs/
+*.pem
+*.key
+*.crt
+
+# 临时文件
+*.pcapng
+analyze_*.js
+planb.md
+task.txt
+tls_debug.md
