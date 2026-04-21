@@ -1,90 +1,150 @@
 -- LLM Gateway 配置文件示例
 --
--- 复制此文件为 config.lua 并填入你的 API keys
+-- 复制此文件为 config.lua 并填入你的配置
+--
+-- 版本: 包含 TLS 支持
 --
 -- Redis Key 设计:
 --   Provider: provider:<name> -> {baseurl, apikey}
 --   LLM: llm:<num> -> {provider, model, cd}
+--   Code: code:<num> -> {provider, model, protocol, proxy}
 --   Embed: embed:provider, embed:model
 --   Rank: rank:provider, rank:model
---   Config: llm:select, llm:config:switch_threshold, llm:config:cool_down
+--   Config: llm:select, code:select
 
 return {
+    -- 端口配置
+    listen = {
+        llm = "0.0.0.0:9090",      -- LLM 网关
+        code = "0.0.0.0:9089",     -- Code 网关 (router2.lua)
+        admin = "0.0.0.0:9093",    -- Admin Console
+        stats = "0.0.0.0:9091",    -- 统计页面
+    },
+
+    -- TLS/HTTPS 配置 (关键迭代)
+    -- 启用后将在独立端口提供 HTTPS 服务
+    -- TLS 解密后请求经过 router2.lua 处理
+    tls = {
+        enabled = true,             -- 是否启用 TLS
+        cert = "certs/server.crt",  -- 证书文件路径 (PEM 格式)
+        key = "certs/server.key",    -- 私钥文件路径 (PEM 格式)
+        listen = "0.0.0.0:443",      -- HTTPS 监听地址 (独立端口)
+        -- 同时需要在 code_http 配置 HTTP 端口
+    },
+
+    -- Code 端口配置 (router2.lua 处理)
+    -- code_tls: TLS 端口 (与 tls.listen 相同)
+    -- code_http: HTTP 端口 (无 TLS，用于兼容)
+    code_tls = "0.0.0.0:443",        -- HTTPS 端口
+    code_http = "0.0.0.0:9443",      -- HTTP 端口 (无 TLS)
+
     -- Redis 连接
     redis_host = "127.0.0.1",
-    redis_port = 6379,
+    redis_port = 7379,
     redis_db = 0,
 
-    -- 网关配置
-    switch_threshold = 2,
-    cool_down = 3,  -- 冷却时间（秒），用于负载均衡
+    -- 负载均衡配置
+    cool_down = 60,  -- 冷却时间（秒），防止同一模型被连续选中
 
-    -- 当前选中的 LLM（主用模型，其他模型作为备用/负载均衡）
-    selected = "01",
+    -- 当前选中的模型
+    llm_selected = "02",   -- LLM 默认模型
+    code_selected = "05", -- Code 默认模型
 
     -- 提供商配置
+    -- 请替换为你自己的 API keys
     providers = {
         siliconflow = {
             baseurl = "https://api.siliconflow.cn/v1",
+            apikey = "YOUR_SILICONFLOW_API_KEY"
+        },
+        siliflowa = {
+            baseurl = "https://api.siliconflow.cn/anthropic/v1",
             apikey = "YOUR_SILICONFLOW_API_KEY"
         },
         zhipu = {
             baseurl = "https://open.bigmodel.cn/api/paas/v4",
             apikey = "YOUR_ZHIPU_API_KEY"
         },
-        openai = {
-            baseurl = "https://api.openai.com/v1",
-            apikey = "YOUR_OPENAI_API_KEY"
+        deepseek = {
+            baseurl = "https://api.deepseek.com/v1",
+            apikey = "YOUR_DEEPSEEK_API_KEY"
         },
-        anthropic = {
-            baseurl = "https://api.anthropic.com",
-            apikey = "YOUR_ANTHROPIC_API_KEY"
+        opengo = {
+            baseurl = "https://opencode.ai/zen/go/v1",
+            apikey = "YOUR_OPengo_API_KEY"
         },
-        -- 本地模型服务
-        local_embed = {
-            baseurl = "http://127.0.0.1:3333",
-            apikey = ""
+        openzen = {
+            baseurl = "https://opencode.ai/zen/v1",
+            apikey = "YOUR_OPenZen_API_KEY"
         },
-        local_rerank = {
-            baseurl = "http://127.0.0.1:3335",
-            apikey = ""
-        }
+        qfacode = {
+            baseurl = "https://qianfan.baidubce.com/anthropic/coding",
+            apikey = "YOUR_QIANFAN_API_KEY"
+        },
+        qfcode = {
+            baseurl = "https://qianfan.baidubce.com/v2/coding",
+            apikey = "YOUR_QIANFAN_API_KEY"
+        },
     },
 
-    -- LLM 配置 (支持多个模型，自动负载均衡)
+    -- LLM 模型配置 (支持多个模型，自动负载均衡)
     -- cd: 冷却时间（秒），防止同一模型被连续选中
     llm = {
-        ["01"] = {
-            provider = "zhipu",
-            model = "GLM-4-Flash",
-            cd = 3
-        },
-        ["02"] = {
-            provider = "siliconflow",
-            model = "Qwen/Qwen3-4B",
-            cd = 3
-        },
-        ["03"] = {
-            provider = "siliconflow",
-            model = "deepseek-ai/DeepSeek-V3",
-            cd = 3
-        },
-        ["04"] = {
-            provider = "openai",
-            model = "gpt-4o-mini",
-            cd = 3
-        }
+        ["02"] = {provider = "siliconflow", model = "Qwen/Qwen3.5-4B", cd = 3},
+        ["04"] = {provider = "siliconflow", model = "THUDM/GLM-4.1V-9B-Thinking", cd = 3},
+        ["05"] = {provider = "siliconflow", model = "Qwen/Qwen3-8B", cd = 3},
+        ["06"] = {provider = "siliconflow", model = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", cd = 3},
+        ["07"] = {provider = "siliconflow", model = "THUDM/GLM-4-9B-0414", cd = 3},
+    },
+
+    -- Code 模型配置 (代码补全)
+    -- protocol: "openai" 或 "anthropic"
+    -- opt: 可选参数组索引
+    -- proxy: 可选代理地址
+    code = {
+        ["01"] = {provider = "opengo", model = "glm-5.1", protocol = "openai", proxy = ""},
+        ["02"] = {provider = "openzen", model = "minimax-m2.5-free", protocol = "openai", proxy = ""},
+        ["03"] = {provider = "qfcode", model = "qianfan-code-latest", protocol = "openai", proxy = ""},
+        ["04"] = {provider = "qfacode", model = "ernie-4.5-turbo-20260402", protocol = "anthropic", opt = "01", proxy = ""},
+        ["05"] = {provider = "qfacode", model = "glm-5", protocol = "anthropic", opt = "04", proxy = ""},
+        ["06"] = {provider = "qfacode", model = "GLM-4.7-Flash", protocol = "anthropic", proxy = ""},
+        ["07"] = {provider = "openzen", model = "gpt-5.3-codex", protocol = "openai", proxy = ""},
+        ["08"] = {provider = "siliflowa", model = "Pro/zai-org/GLM-5.1", protocol = "anthropic", proxy = ""},
+        ["09"] = {provider = "qfacode", model = "deepseek-v3.2", protocol = "anthropic", proxy = ""},
+        ["10"] = {provider = "opengo", model = "minimax-m2.7", protocol = "openai", proxy = ""},
+        ["11"] = {provider = "zhipu", model = "GLM-4-Flash", protocol = "openai", proxy = ""},
+        ["12"] = {provider = "siliconflow", model = "Qwen/Qwen3-8B", protocol = "openai", proxy = ""},
+        ["13"] = {provider = "qfacode", model = "kimi-k2.5", protocol = "anthropic", proxy = ""},
+        ["14"] = {provider = "opengo", model = "glm-5", protocol = "openai", proxy = ""},
+        ["15"] = {provider = "siliflowa", model = "Qwen/Qwen3-8B", protocol = "anthropic", proxy = ""},
+        ["16"] = {provider = "deepseek", model = "deepseek-reasoner", protocol = "openai", proxy = ""},
+    },
+
+    -- 可选参数组
+    opt = {
+        ["01"] = {max_tokens = "12280"},
+        ["02"] = {stream = "true"},
+        ["03"] = {max_tokens = "999", temperature = "0.7", top_p = "0.9"},
+        ["04"] = {temperature = "0.2"},
+    },
+
+    -- 模型映射 (客户端模型名 -> 网关模型编号)
+    modelmap = {
+        ["claude-opus-4-6"] = "05",
+        ["claude-sonnet-4-6"] = "04",
+        ["haru"] = {"04", "02", "15"},
+        ["qianfan-code-latest"] = "05",
     },
 
     -- Embeddings 配置
     embed = {
-        provider = "local_embed",
-        model = "bge-large-zh-v1.5"
+        provider = "Local1",
+        model = "bge-large-zh-v1.5-q8_0"
     },
 
     -- Rerank 配置
     rank = {
-        provider = "local_rerank",
-        model = "bge-reranker-base"
+        provider = "Local2",
+        model = "qwen3-reranker-0.6b-q8_0"
     }
 }
