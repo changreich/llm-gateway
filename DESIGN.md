@@ -300,6 +300,8 @@ return {
 | `LLM_BASEURL` | 默认 API 地址 | `https://api.anthropic.com` |
 | `LLM_API_KEY` | 默认 API Key | (空) |
 | `LLM_MODEL` | 默认模型 | `claude-sonnet-4-20250514` |
+| `LLM_LOG_MODE` | 日志模式 (`stdout` 或 `file`) | `stdout` |
+| `LLM_LOG_FILE` | 日志文件路径 (仅 mode=file) | `gateway.log` |
 
 ## Lua 函数接口
 
@@ -340,3 +342,61 @@ REDIS_URL=redis://127.0.0.1:6379 LLM_LISTEN=0.0.0.0:9090 ./target/release/llm-ga
 - 使用 reqwest 的 `rustls-tls` feature
 - 默认跳过证书验证（适用于透明代理场景）
 - 设置 `LLM_TLS_VERIFY=1` 启用证书验证
+
+## SDK 模块 (lua/sdk/)
+
+| SDK 文件 | 提供商 | 协议 |
+|----------|--------|------|
+| `openai.lua` | OpenAI 及兼容平台 | OpenAI Chat Completions |
+| `anthropic.lua` | Anthropic Claude | Anthropic Messages API |
+| `alibaba.lua` | 阿里云百炼 (DashScope/Qwen) | OpenAI 兼容 (compatible-mode) |
+| `siliconflow.lua` | SiliconFlow | OpenAI 兼容 |
+| `zhipu.lua` | 智谱 GLM | OpenAI 兼容 |
+| `opengo.lua` | OpenCode Go | OpenAI 兼容 |
+| `sdk_siliconflow_anthropic.lua` | SiliconFlow Anthropic 端点 | Anthropic Messages API |
+
+### Alibaba (DashScope/Qwen) SDK
+
+基于 `@ai-sdk/alibaba` 包实现，关键特性：
+
+- **端点**: `/compatible-mode/v1/chat/completions` (OpenAI 兼容模式)
+- **模型**: qwen3-max, qwen-plus, qwen-flash, qwen-turbo, qwq-plus, qwen-coder 等
+- **思考模式**: 请求可加 `enable_thinking=true`，响应含 `reasoning_content` 字段
+- **缓存 Token**: 响应中 `prompt_tokens_details.cached_tokens`
+- **推理 Token**: 响应中 `completion_tokens_details.reasoning_tokens`
+
+### SDK 接口
+
+每个 SDK 模块实现以下接口：
+
+```lua
+function sdk.get_endpoint(baseurl)     -- 返回 API 端点路径
+function sdk.get_extra_headers(api_key) -- 返回额外请求头
+function sdk.transform_request(body_str, model, config) -- 转换请求
+function sdk.transform_response(response_str) -- 转换响应
+function sdk.extract_tokens(response_str) -- 提取 token 用量 (prompt, completion)
+```
+
+## 日志配置
+
+支持两种日志输出模式，通过 `config.lua` 或环境变量配置：
+
+### config.lua 配置
+
+```lua
+log = {
+    mode = "stdout",      -- "stdout" (直接输出到控制台, 默认) 或 "file" (输出到文件)
+    file = "gateway.log", -- 日志文件路径，仅 mode="file" 时使用
+},
+```
+
+### 环境变量覆盖
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `LLM_LOG_MODE` | `stdout` 或 `file` | `stdout` |
+| `LLM_LOG_FILE` | 日志文件路径 | `gateway.log` |
+
+### 优先级
+
+环境变量 > config.lua > 默认值

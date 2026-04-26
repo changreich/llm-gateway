@@ -6,6 +6,7 @@
 //! Pingora 职责：接收请求 → 传给 Lua (header) → 执行决策 → 上报响应
 //! Lua 职责：Redis 配置读取、URL 重写、Token 统计
 
+mod anthropic_client;
 mod anthropic_convert;
 mod sse_stream;
 mod tls_server;
@@ -88,6 +89,10 @@ static TLS_ENABLED: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
 static TLS_CERT: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static TLS_KEY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static TLS_LISTEN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("0.0.0.0:443".to_string()));
+
+/// 日志配置 (从 config.lua 读取)
+static LOG_MODE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("stdout".to_string()));
+static LOG_FILE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("gateway.log".to_string()));
 
 /// Code 端口配置 (router2.lua 处理)
 /// code_tls: TLS 端口 (443)
@@ -1159,6 +1164,354 @@ impl LuaGateway {
     fn new(lua: Arc<RwLock<LuaRuntime>>, port: u16, transform: bool) -> Self {
         Self { lua, port, transform }
     }
+
+    /// SDK 模式处理：443 端口默认 Anthropic 协议
+    ///
+    /// SSE 请求由 Rust 层处理，非流式请求交给 Lua 层处理。
+    /// 通过请求 JSON 中的 stream 字段区分。
+    async fn handle_sdk_mode(
+        &self,
+        session: &mut Session,
+        ctx: &mut GatewayCtx,
+        method: &str,
+        path: &str,
+    ) -> Result<bool> {
+        info!("[SDK:443] Processing {} {}", method, path);
+
+        // 只处理 POST 请求
+        if method != "POST" {
+            let error_msg = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Only POST requests are supported"}}"#;
+            session.respond_error_with_body(405, Bytes::from(error_msg)).await?;
+            return Ok(true);
+        }
+
+        // 读取请求体
+        let mut full_body = Vec::new();
+        loop {
+            match session.read_request_body().await {
+                Ok(Some(chunk)) => full_body.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("[SDK:443] Failed to read request body: {}", e);
+                    break;
+                }
+            }
+        }
+        ctx.request_body = full_body.clone();
+        info!("[SDK:443] Request body length: {} bytes", full_body.len());
+
+        // 检查是否是流式请求
+        let stream_requested = anthropic_client::extract_stream(&full_body);
+        info!("[SDK:443] stream={}", stream_requested);
+
+        if stream_requested {
+            // SSE 流式请求：由 Rust 层处理
+            self.handle_sdk_sse(session, ctx, &full_body).await
+        } else {
+            // 非流式请求：交给 Lua 层处理
+            info!("[SDK:443] Non-streaming request, delegating to Lua");
+            let decision = {
+                let lua = self.lua.read().map_err(|_| {
+                    Error::explain(ErrorType::InternalError, "Lua runtime lock poisoned")
+                })?;
+                let headers = extract_headers(session);
+                // 使用特殊的路径标识 SDK 模式
+                lua.call_on_request(method, "/sdk/anthropic", headers, &full_body)?
+            };
+
+            // 处理 Lua 返回的决策
+            match decision.action.as_str() {
+                "reject" => {
+                    let body = Bytes::from(decision.response_body.clone());
+                    session.respond_error_with_body(decision.status, body).await?;
+                    Ok(true)
+                }
+                "proxy" => {
+                    // 使用现有的代理逻辑处理非流式请求
+                    self.handle_lua_proxy(session, ctx, decision, &full_body).await
+                }
+                _ => {
+                    let error_msg = r#"{"type":"error","error":{"type":"internal_error","message":"Unknown action"}}"#;
+                    session.respond_error_with_body(500, Bytes::from(error_msg)).await?;
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    /// 处理 SSE 流式请求 (Rust 层)
+    async fn handle_sdk_sse(
+        &self,
+        session: &mut Session,
+        ctx: &mut GatewayCtx,
+        full_body: &[u8],
+    ) -> Result<bool> {
+        let original_model = anthropic_client::extract_model(full_body)
+            .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+
+        info!("[SDK:443/SSE] model={}", original_model);
+
+        // 从 Redis 获取配置
+        let (provider_config, target_model, selected_num) = {
+            let mut conn = match get_redis_conn() {
+                Some(c) => c,
+                None => {
+                    let error_msg = r#"{"type":"error","error":{"type":"internal_error","message":"Redis connection unavailable"}}"#;
+                    session.respond_error_with_body(500, Bytes::from(error_msg)).await?;
+                    return Ok(true);
+                }
+            };
+
+            let selected = if !original_model.is_empty() {
+                let modelmap_key = format!("modelmap:{}", original_model);
+                if let Ok(Some(num)) = redis::cmd("GET")
+                    .arg(&modelmap_key)
+                    .query::<Option<String>>(&mut conn)
+                {
+                    num
+                } else {
+                    redis::cmd("GET")
+                        .arg("code:select")
+                        .query::<Option<String>>(&mut conn)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "01".to_string())
+                }
+            } else {
+                redis::cmd("GET")
+                    .arg("code:select")
+                    .query::<Option<String>>(&mut conn)
+                    .ok()
+                    .flatten()
+                        .unwrap_or_else(|| "01".to_string())
+            };
+
+            let code_key = format!("code:{}", selected);
+            let provider = redis::cmd("HGET")
+                .arg(&code_key)
+                .arg("provider")
+                .query::<Option<String>>(&mut conn)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "anthropic".to_string());
+            let model = redis::cmd("HGET")
+                .arg(&code_key)
+                .arg("model")
+                .query::<Option<String>>(&mut conn)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| original_model.clone());
+
+            let provider_key = format!("provider:{}", provider);
+            let baseurl = redis::cmd("HGET")
+                .arg(&provider_key)
+                .arg("baseurl")
+                .query::<Option<String>>(&mut conn)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            let apikey = redis::cmd("HGET")
+                .arg(&provider_key)
+                .arg("apikey")
+                .query::<Option<String>>(&mut conn)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+
+            let host = baseurl
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(&baseurl)
+                .to_string();
+
+            ((host, baseurl, apikey), model, selected)
+        };
+
+        let (host, baseurl, apikey) = provider_config;
+        let upstream_url = format!("{}/v1/messages", baseurl.trim_end_matches('/'));
+
+        info!("[SDK:443/SSE] Routing to {} (model={}, upstream={})", selected_num, target_model, upstream_url);
+
+        // 构建请求体
+        let mut request_json: serde_json::Value = serde_json::from_slice(full_body)
+            .map_err(|e| Error::explain(ErrorType::InternalError, format!("invalid JSON: {}", e)))?;
+        request_json["model"] = serde_json::Value::String(target_model.clone());
+        let request_body = serde_json::to_string(&request_json)
+            .map_err(|e| Error::explain(ErrorType::InternalError, format!("JSON encode: {}", e)))?;
+
+        // 创建 HTTP 客户端
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(!*SKIP_TLS_VERIFY)
+            .build()
+            .map_err(|e| Error::explain(ErrorType::InternalError, format!("create client: {}", e)))?;
+
+        let req = client
+            .post(&upstream_url)
+            .header("Content-Type", "application/json")
+            .header("Host", &host)
+            .header("x-api-key", &apikey)
+            .header("anthropic-version", "2023-06-01")
+            .body(request_body);
+
+        // 注册 SSE 连接
+        let conn_id = sse_register(String::new(), String::new(), target_model.clone());
+
+        let response = req.send().await
+            .map_err(|e| {
+                sse_unregister(conn_id);
+                Error::explain(ErrorType::InternalError, format!("upstream error: {}", e))
+            })?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            let error_msg = extract_error_message(&error_body);
+            warn!("[SDK:443/SSE] Upstream error: status={}, msg={}", status, &error_msg[..error_msg.len().min(200)]);
+
+            let error_sse = generate_error_sse_stream(&error_msg, &original_model);
+            let mut resp = ResponseHeader::build(200, None)?;
+            resp.insert_header("Content-Type", "text/event-stream")?;
+            resp.insert_header("Cache-Control", "no-cache")?;
+            resp.insert_header("Connection", "keep-alive")?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session.write_response_body(Some(Bytes::from(error_sse)), true).await?;
+
+            sse_unregister(conn_id);
+            return Ok(true);
+        }
+
+        // 成功响应，开始流式传输
+        let mut resp = ResponseHeader::build(200, None)?;
+        resp.insert_header("Content-Type", "text/event-stream")?;
+        resp.insert_header("Cache-Control", "no-cache")?;
+        resp.insert_header("Connection", "keep-alive")?;
+        session.write_response_header(Box::new(resp), false).await?;
+
+        let mut sse_parser = anthropic_client::AnthropicSseParser::new();
+        let mut stream_state = anthropic_client::StreamState::default();
+
+        let mut stream_response = response;
+        while let Some(chunk) = stream_response.chunk().await.map_err(|e| {
+            sse_unregister(conn_id);
+            Error::explain(ErrorType::InternalError, format!("chunk read error: {}", e))
+        })? {
+            sse_parser.push_data(&chunk);
+
+            let events = sse_parser.extract_events();
+            for event in events {
+                if let Some(output) = anthropic_client::process_sse_event(event, &mut stream_state) {
+                    if let Err(e) = session.write_response_body(Some(Bytes::from(output)), false).await {
+                        warn!("[SDK:443/SSE] Failed to write SSE event: {}", e);
+                    }
+                }
+            }
+        }
+
+        // 确保流正常结束
+        if !stream_state.finished {
+            let end_event = format!("event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n");
+            let _ = session.write_response_body(Some(Bytes::from(end_event)), false).await;
+        }
+
+        session.write_response_body(None, true).await?;
+
+        // 更新统计
+        let input_tokens = stream_state.usage.input_tokens;
+        let output_tokens = stream_state.usage.output_tokens;
+        if input_tokens > 0 || output_tokens > 0 {
+            CODE_STATS_TOTAL_CALLS.fetch_add(1, Ordering::Relaxed);
+            CODE_STATS_TOTAL_PROMPT.fetch_add(input_tokens, Ordering::Relaxed);
+            CODE_STATS_TOTAL_COMPLETION.fetch_add(output_tokens, Ordering::Relaxed);
+            if let Ok(mut models) = CODE_STATS_MODELS.write() {
+                let entry = models.entry(selected_num.clone()).or_insert_with(ModelStats::default);
+                entry.calls += 1;
+                entry.prompt += input_tokens;
+                entry.completion += output_tokens;
+                entry.last_prompt = input_tokens;
+                entry.last_completion = output_tokens;
+            }
+            info!("[SDK:443/SSE] Stats: num={}, prompt={}, completion={}", selected_num, input_tokens, output_tokens);
+        }
+
+        info!("[SDK:443/SSE] Completed (msg_id={}, tokens: {}+{})",
+            stream_state.message_id, input_tokens, output_tokens);
+
+        sse_unregister(conn_id);
+        Ok(true)
+    }
+
+    /// 处理 Lua 返回的代理决策 (非流式)
+    async fn handle_lua_proxy(
+        &self,
+        session: &mut Session,
+        ctx: &mut GatewayCtx,
+        decision: RequestDecision,
+        _full_body: &[u8],
+    ) -> Result<bool> {
+        ctx.decision = decision.clone();
+
+        let upstream_url = if decision.tls {
+            format!("https://{}{}", decision.addr, decision.rewrite_path)
+        } else {
+            format!("http://{}{}", decision.addr, decision.rewrite_path)
+        };
+
+        info!("[SDK:443/Lua] Proxying to: {}", upstream_url);
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(!*SKIP_TLS_VERIFY || !decision.tls)
+            .build()
+            .map_err(|e| Error::explain(ErrorType::InternalError, format!("create client: {}", e)))?;
+
+        let mut req = client
+            .post(&upstream_url)
+            .header("Content-Type", "application/json")
+            .body(decision.new_request_body.clone().into_bytes());
+
+        if !decision.api_key.is_empty() {
+            req = req.header("x-api-key", &decision.api_key);
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+
+        let host_only = decision.addr.split('/').next().unwrap_or(&decision.addr);
+        req = req.header("Host", host_only);
+
+        let response = req.send().await
+            .map_err(|e| Error::explain(ErrorType::InternalError, format!("upstream error: {}", e)))?;
+
+        let status = response.status();
+        let response_body = response.text().await
+            .map_err(|e| Error::explain(ErrorType::InternalError, format!("read response: {}", e)))?;
+
+        ctx.response_status = status.as_u16();
+
+        // 提取 token 统计
+        if let Some(usage) = anthropic_client::extract_usage_from_response(response_body.as_bytes()) {
+            let selected = CODE_STATS_SELECTED.read().map(|s| s.clone()).unwrap_or_else(|_| "01".to_string());
+            CODE_STATS_TOTAL_CALLS.fetch_add(1, Ordering::Relaxed);
+            CODE_STATS_TOTAL_PROMPT.fetch_add(usage.input_tokens, Ordering::Relaxed);
+            CODE_STATS_TOTAL_COMPLETION.fetch_add(usage.output_tokens, Ordering::Relaxed);
+            if let Ok(mut models) = CODE_STATS_MODELS.write() {
+                let entry = models.entry(selected).or_insert_with(ModelStats::default);
+                entry.calls += 1;
+                entry.prompt += usage.input_tokens;
+                entry.completion += usage.output_tokens;
+                entry.last_prompt = usage.input_tokens;
+                entry.last_completion = usage.output_tokens;
+            }
+        }
+
+        let mut resp = ResponseHeader::build(status.as_u16(), None)?;
+        resp.insert_header("Content-Type", "application/json")?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session.write_response_body(Some(Bytes::from(response_body)), true).await?;
+
+        info!("[SDK:443/Lua] Completed: status={}", status);
+        Ok(true)
+    }
 }
 
 #[async_trait]
@@ -1204,6 +1557,13 @@ impl ProxyHttp for LuaGateway {
             let body = serde_json::to_string_pretty(&json).unwrap_or_default();
             session.respond_error_with_body(200, Bytes::from(body)).await?;
             return Ok(true);
+        }
+
+        // ================================================================
+        // SDK 模式：443 端口默认 Anthropic 协议，无需 URL 路径匹配
+        // ================================================================
+        if self.port == 443 {
+            return self.handle_sdk_mode(session, ctx, &method, &path).await;
         }
 
         // 读取请求体 (POST/PUT 等方法) - 循环读取完整 body
@@ -1728,6 +2088,48 @@ fn extract_headers(session: &Session) -> HashMap<String, String> {
 ///   rank:provider, rank:model
 ///   llm:select -> 当前选中的模型编号
 ///   llm:config:cool_down -> 冷却时间
+/// 预读取日志配置 (必须在 env_logger 初始化之前调用)
+///
+/// 优先级: 环境变量 > config.lua > 默认值 ("stdout")
+/// 返回 (mode, file) 元组
+fn preload_log_config(config_path: &PathBuf) -> (String, String) {
+    let mut log_mode = "stdout".to_string();
+    let mut log_file = "gateway.log".to_string();
+
+    // 先从 config.lua 读取
+    if let Ok(config_content) = std::fs::read_to_string(config_path) {
+        let lua = Lua::new();
+        if let Ok(config_table) = lua.load(&config_content).eval::<Table>() {
+            if let Ok(log_cfg) = config_table.get::<Table>("log") {
+                if let Ok(mode) = log_cfg.get::<String>("mode") {
+                    log_mode = mode;
+                }
+                if let Ok(file) = log_cfg.get::<String>("file") {
+                    log_file = file;
+                }
+            }
+        }
+    }
+
+    // 环境变量覆盖
+    if let Ok(mode) = std::env::var("LLM_LOG_MODE") {
+        log_mode = mode;
+    }
+    if let Ok(file) = std::env::var("LLM_LOG_FILE") {
+        log_file = file;
+    }
+
+    // 写入全局变量，供后续使用
+    if let Ok(mut guard) = LOG_MODE.write() {
+        *guard = log_mode.clone();
+    }
+    if let Ok(mut guard) = LOG_FILE.write() {
+        *guard = log_file.clone();
+    }
+
+    (log_mode, log_file)
+}
+
 fn preload_config(config_path: &PathBuf) {
     let config_content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -1876,6 +2278,8 @@ fn preload_config(config_path: &PathBuf) {
             info!("Set TLS_LISTEN from env: {}", tls_listen);
         }
     }
+
+    // 日志配置已在 preload_log_config 中处理 (在 env_logger 初始化之前)
 
     let mut conn = match get_redis_conn() {
         Some(c) => c,
@@ -2147,23 +2551,43 @@ fn main() {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    // 日志输出到文件 (gateway.log)
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("gateway.log")
-        .expect("Failed to open gateway.log");
-    let tls_aware_writer = TlsAwareLogWriter::new(log_file);
-    let log_file_box: Box<dyn std::io::Write + Send> = Box::new(tls_aware_writer);
+    // 解析 config.lua 路径 (需要在日志初始化之前读取日志配置)
+    let default_config_path = PathBuf::from("lua/config.lua");
+    let config_path_for_log = std::env::var("LLM_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or(default_config_path);
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Pipe(log_file_box))
-        .format(|buf, record| {
-            use std::io::Write;
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-            writeln!(buf, "[{} {}:{}] {}", record.level(), record.target(), record.line().unwrap_or(0), record.args())
-        })
-        .init();
+    // 预读取日志配置
+    let (log_mode, log_file) = preload_log_config(&config_path_for_log);
+
+    // 根据日志模式配置 env_logger
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    builder.format(|buf, record| {
+        use std::io::Write;
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        writeln!(buf, "[{} {}:{}] {}", record.level(), record.target(), record.line().unwrap_or(0), record.args())
+    });
+
+    if log_mode == "file" {
+        // 文件模式：输出到日志文件
+        match std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
+            Ok(file) => {
+                let tls_aware_writer = TlsAwareLogWriter::new(file);
+                let log_file_box: Box<dyn std::io::Write + Send> = Box::new(tls_aware_writer);
+                builder.target(env_logger::Target::Pipe(log_file_box));
+            }
+            Err(e) => {
+                eprintln!("Failed to open log file '{}': {}, falling back to stdout", log_file, e);
+                builder.target(env_logger::Target::Stdout);
+            }
+        }
+    } else {
+        // stdout 模式 (默认)：直接输出到控制台
+        builder.target(env_logger::Target::Stdout);
+    }
+
+    builder.init();
+    info!("Log mode: {} ({})", log_mode, if log_mode == "file" { &log_file } else { "console" });
 
     // 使用环境变量或默认值配置
     // 注意：preload_config 会先设置全局端口变量，环境变量优先级最高

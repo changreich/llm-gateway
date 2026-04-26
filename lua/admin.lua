@@ -77,7 +77,12 @@ local function get_all_code_configs()
         if val then
             local parts = split_pipe(val)
             if #parts >= 2 then
-                configs[num] = { provider = parts[1], model = parts[2], opt = parts[3] or "" }
+                configs[num] = {
+                    provider = parts[1],
+                    model = parts[2],
+                    sdk = parts[3] or "openai",      -- SDK 类型
+                    params = parts[4] or ""           -- 参数覆盖配置引用
+                }
             end
         end
     end
@@ -247,10 +252,10 @@ local function generate_config_lua()
         table.insert(lines, "    code = {")
         for _, num in ipairs(code_nums) do
             local cfg = code_configs[num]
-            local line = string.format('        ["%s"] = {provider = "%s", model = "%s"',
-                num, cfg.provider, cfg.model)
-            if cfg.opt and cfg.opt ~= "" then
-                line = line .. string.format(', opt = "%s"', cfg.opt)
+            local line = string.format('        ["%s"] = {provider = "%s", model = "%s", sdk = "%s"',
+                num, cfg.provider, cfg.model, cfg.sdk)
+            if cfg.params and cfg.params ~= "" then
+                line = line .. string.format(', params = "%s"', cfg.params)
             end
             -- 添加 proxy 字段
             local code_proxy = safe_redis_get("code:" .. num .. ":proxy") or ""
@@ -381,12 +386,12 @@ local function generate_admin_html()
         local cd_remaining = code_cd_status[num] or 0
         local status_icon = cd_remaining > 0 and '<span class="status-dot cd"></span>冷却中' or '<span class="status-dot ok"></span>正常'
         code_rows = code_rows .. string.format(
-            '<tr data-id="%s" data-provider="%s" data-model="%s" data-opt="%s"><td><span class="num%s">%s</span></td><td><span class="provider">%s</span></td>' ..
-            '<td><span class="model">%s</span></td><td>%s</td>' ..
+            '<tr data-id="%s" data-provider="%s" data-model="%s" data-sdk="%s" data-params="%s"><td><span class="num%s">%s</span></td><td><span class="provider">%s</span></td>' ..
+            '<td><span class="model">%s</span></td><td><span class="sdk">%s</span></td><td>%s</td>' ..
             '<td class="status">%s</td></tr>',
-            num, escape_html(cfg.provider), escape_html(cfg.model), escape_html(cfg.opt),
+            num, escape_html(cfg.provider), escape_html(cfg.model), escape_html(cfg.sdk), escape_html(cfg.params),
             sel == " selected" and " active" or "", num, escape_html(cfg.provider),
-            escape_html(cfg.model), cfg.opt ~= "" and escape_html(cfg.opt) or "-", status_icon
+            escape_html(cfg.model), escape_html(cfg.sdk), cfg.params ~= "" and escape_html(cfg.params) or "-", status_icon
         )
     end
 
@@ -508,7 +513,7 @@ function handler.on_request(method, path, headers, body)
             if val then
                 local parts = split_pipe(val)
                 if #parts >= 2 then
-                    return { action = "reject", status = 200, body = '{"ok":true,"provider":"' .. parts[1] .. '","model":"' .. parts[2] .. '","opt":"' .. (parts[3] or "") .. '"}' }
+                    return { action = "reject", status = 200, body = '{"ok":true,"provider":"' .. parts[1] .. '","model":"' .. parts[2] .. '","sdk":"' .. (parts[3] or "openai") .. '","params":"' .. (parts[4] or "") .. '"}' }
                 end
             end
         end
@@ -609,9 +614,10 @@ function handler.on_request(method, path, headers, body)
         local num = url_decode(path:match("num=([^&]+)") or "")
         local provider = url_decode(path:match("provider=([^&]+)") or "")
         local model = url_decode(path:match("model=([^&]+)") or "")
-        local opt = url_decode(path:match("opt=([^&]+)") or "")
+        local sdk = url_decode(path:match("sdk=([^&]+)") or "openai")
+        local params = url_decode(path:match("params=([^&]+)") or "")
         if num and num ~= "" and provider and provider ~= "" and model and model ~= "" then
-            local ok = pcall(redis_set, "code:" .. num, provider .. "|" .. model .. "|" .. opt)
+            local ok = pcall(redis_set, "code:" .. num, provider .. "|" .. model .. "|" .. sdk .. "|" .. params)
             return { action = "reject", status = 200, body = ok and '{"ok":true}' or '{"ok":false,"error":"redis error"}' }
         end
         return { action = "reject", status = 400, body = '{"ok":false,"error":"missing params"}' }

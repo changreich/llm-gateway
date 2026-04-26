@@ -3,7 +3,7 @@
 -- 特性：
 --   - URL 精确匹配包含 "code" 字样
 --   - 通过 code:select 获取当前配置序号
---   - 支持多 opt 组合 (01+02)
+--   - 支持多 params 组合 (01+02)
 --   - 重建请求体，覆盖原请求参数
 --   - 支持 Anthropic provider 直通（不转换格式）
 --   - 无负载均衡、无 fallback
@@ -88,12 +88,16 @@ local function init_config_to_redis()
         pcall(redis_set, "global:proxy", default_config.proxy)
     end
 
-    -- 写入 code 配置 (含 protocol)
-    -- Redis 格式: provider|model|opt|protocol
+    -- 写入 code 配置 (含 sdk)
+    -- Redis 格式: provider|model|sdk|params
+    -- sdk: SDK 类型 ("openai" 或 "anthropic")
+    -- params: 参数覆盖配置引用 (如 "01+02")
     for num, cfg in pairs(default_code) do
         local key = "code:" .. num
-        local protocol = cfg.protocol or "openai"  -- 默认 openai (需要转换)
-        local value = (cfg.provider or "") .. "|" .. (cfg.model or "") .. "|" .. (cfg.opt or "") .. "|" .. protocol
+        -- 兼容旧配置: cfg.sdk 优先，否则用 cfg.opt (旧字段名)
+        local sdk = cfg.sdk or cfg.opt or "openai"
+        local params = cfg.params or ""
+        local value = (cfg.provider or "") .. "|" .. (cfg.model or "") .. "|" .. sdk .. "|" .. params
         pcall(redis_set, key, value)
         -- 写入 code 级代理配置
         if cfg.proxy then
@@ -189,7 +193,7 @@ local function safe_redis_incr(key)
 end
 
 -- 获取 code 配置
--- Redis 格式: provider|model|opt|protocol
+-- Redis 格式: provider|model|sdk|params
 local function get_code_config(num)
     local config = safe_redis_get("code:" .. num)
     if not config then
@@ -204,8 +208,8 @@ local function get_code_config(num)
     return {
         provider = parts[1],
         model = parts[2],
-        opt = parts[3] or "",
-        protocol = parts[4] or "openai"  -- 默认 openai (需要转换)
+        sdk = parts[3] or "openai",      -- SDK 类型
+        params = parts[4] or ""           -- 参数覆盖配置引用
     }
 end
 
@@ -303,14 +307,14 @@ local function get_provider_config(name)
     }
 end
 
--- 获取 opt 配置项
-local function get_opt_config(opt_str)
-    -- opt_str: "01+02" 或 "01"
-    if not opt_str or opt_str == "" then
+-- 获取 params 配置项
+local function get_opt_config(params_str)
+    -- params_str: "01,03,02" 或 "01"
+    if not params_str or params_str == "" then
         return {}
     end
 
-    local opt_ids = split(opt_str, "+")
+    local opt_ids = split(params_str, ",")
     local result = {}
 
     for _, opt_id in ipairs(opt_ids) do
@@ -481,15 +485,15 @@ local function detect_request_format(body)
 end
 
 -- 重建请求体
-local function rebuild_request_body(original_body, model, opt_config, provider_sdk, provider_cfg, protocol)
+local function rebuild_request_body(original_body, model, opt_config, provider_sdk, provider_cfg, sdk)
     -- 解析原请求体
     local ok, orig = pcall(json_decode, original_body)
     if not ok or type(orig) ~= "table" then
         return nil
     end
 
-    -- ★ Anthropic provider 直通：protocol="anthropic" 不做格式转换
-    if protocol == "anthropic" then
+    -- ★ Anthropic provider 直通：sdk="anthropic" 不做格式转换
+    if sdk == "anthropic" then
         local request_format = detect_request_format(original_body)
         pcall(redis_set, "code:debug_format",
             string.format("skip_conversion:protocol=%s req_format=%s", protocol, request_format))
@@ -709,8 +713,12 @@ function handler.on_request(method, path, headers, body)
         return { action = "reject", status = 200, body = "[]" }
     end
 
-    -- URL 匹配：路径中包含 "code" 字样
-    if not string.find(path, "code") then
+    -- SDK 模式：443 端口非流式请求，跳过 URL 匹配检查
+    -- 路径 /sdk/anthropic 表示来自 SDK 模式的请求
+    local is_sdk_mode = (path == "/sdk/anthropic")
+
+    -- URL 匹配：路径中包含 "code" 字样 (SDK 模式跳过此检查)
+    if not is_sdk_mode and not string.find(path, "code") then
         return {
             action = "reject",
             status = 404,
@@ -756,8 +764,8 @@ function handler.on_request(method, path, headers, body)
         }
     end
 
-    -- 获取 opt 配置
-    local opt_config = get_opt_config(code_cfg.opt)
+    -- 获取 params 配置 (参数覆盖配置)
+    local opt_config = get_opt_config(code_cfg.params)
 
     -- 加载 SDK
     local provider_sdk = sdk.load(code_cfg.provider)
@@ -765,7 +773,7 @@ function handler.on_request(method, path, headers, body)
     pcall(redis_set, "code:debug", "loaded sdk:" .. tostring(provider_sdk))
 
     -- 重建请求体
-    local new_body = rebuild_request_body(body, code_cfg.model, opt_config, provider_sdk, provider_cfg, code_cfg.protocol)
+    local new_body = rebuild_request_body(body, code_cfg.model, opt_config, provider_sdk, provider_cfg, code_cfg.sdk)
     if not new_body then
         return {
             action = "reject",
@@ -857,8 +865,8 @@ function handler.on_request(method, path, headers, body)
     -- 保存转换后的请求到 Redis (code:raw2)
     save_translated_request(new_body, selected, code_cfg.provider, code_cfg.model)
 
-    -- ★ 是否需要格式转换 (anthropic 协议不需要)
-    local need_transform = (code_cfg.protocol ~= "anthropic")
+    -- ★ 是否需要格式转换 (anthropic SDK 不需要)
+    local need_transform = (code_cfg.sdk ~= "anthropic")
 
     -- ★ 获取代理配置
     local proxy_url = get_proxy_config(selected, code_cfg.provider)

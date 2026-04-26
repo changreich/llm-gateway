@@ -145,13 +145,16 @@ redis-cli -p 7379 SET "llm:01" "zhipu|GLM-4-Flash|0"
 | Key | 格式 | 示例 |
 |-----|------|------|
 | `code:select` | 序号 | `01` |
-| `code:01` | `provider\|model\|opt` | `zhipu\|GLM-4-Flash\|01` |
-| `code:02` | `provider\|model\|opt` | `openai\|gpt-4o\|02` |
+| `code:01` | `provider\|model\|sdk\|params` | `zhipu\|GLM-4-Flash\|openai\|01,03` |
+| `code:02` | `provider\|model\|sdk\|params` | `openai\|gpt-4o\|anthropic\|02` |
 
 **字段说明**:
 - `provider`: 提供商名称（复用 `provider:*` 配置）
 - `model`: 模型名称
-- `opt`: 选项编号，引用 `opt:*` 配置（空表示无选项）
+- `sdk`: SDK 类型（"openai" 或 "anthropic"）
+  - `openai`: 需要将 Anthropic 格式转换为 OpenAI 格式
+  - `anthropic`: 直接透传，不做格式转换
+- `params`: 参数覆盖配置引用（引用 `opt:*` 配置，多个用 `,` 分隔）
 
 ### Opt 选项配置
 
@@ -170,12 +173,13 @@ redis-cli -p 7379 SET "llm:01" "zhipu|GLM-4-Flash|0"
 当请求 `/v1/code/chat/completions` 时：
 1. URL 包含 "code" → 走 code 路由
 2. 查询 `code:select` → `01`
-3. 查询 `code:01` → `zhipu|GLM-4-Flash|01+02`
-4. 解析 opt = `01+02`（多个选项用 `+` 分隔）
+3. 查询 `code:01` → `zhipu|GLM-4-Flash|openai|01,03`
+4. 解析 sdk = `openai`，params = `01,03`（多个选项用 `,` 分隔）
 5. 查询 `opt:01:*` 获取所有配置项
-6. 查询 `opt:02:*` 获取所有配置项
+6. 查询 `opt:03:*` 获取所有配置项
 7. **重建请求体**：用配置参数替换原请求中的对应字段
-8. 转发到 zhipu
+8. 根据 sdk 类型决定是否转换格式
+9. 转发到 zhipu
 
 **请求体重建示例**:
 
@@ -191,9 +195,10 @@ redis-cli -p 7379 SET "llm:01" "zhipu|GLM-4-Flash|0"
 
 配置：
 ```
+code:01 = zhipu|GLM-4-Flash|openai|01,03
 opt:01:max_tokens → 999
 opt:01:temperature → 0.7
-opt:02:stream → true
+opt:03:stream → true
 ```
 
 重建后请求体：

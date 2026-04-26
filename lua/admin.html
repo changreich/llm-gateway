@@ -924,8 +924,15 @@ tbody tr.selected {
               <input type="text" id="code-detail-model" placeholder="输入模型名称">
             </div>
             <div class="form-group">
-              <label>Opt ID</label>
-              <input type="text" id="code-detail-opt" placeholder="可选">
+              <label>SDK 类型</label>
+              <select id="code-detail-sdk">
+                <option value="openai">openai (需转换)</option>
+                <option value="anthropic">anthropic (直通)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Params (参数覆盖配置ID，逗号分隔)</label>
+              <input type="text" id="code-detail-params" placeholder="如: 01,03">
             </div>
           </div>
         </div>
@@ -944,7 +951,8 @@ tbody tr.selected {
                   <th>编号</th>
                   <th>Provider</th>
                   <th>Model</th>
-                  <th>Opt</th>
+                  <th>SDK</th>
+                  <th>Params</th>
                   <th>状态</th>
                 </tr>
               </thead>
@@ -1249,7 +1257,8 @@ function showCodeDetail(id) {
     row.classList.add('selected');
     document.getElementById('code-detail-provider').value = row.dataset.provider || '';
     document.getElementById('code-detail-model').value = row.dataset.model || '';
-    document.getElementById('code-detail-opt').value = row.dataset.opt || '';
+    document.getElementById('code-detail-sdk').value = row.dataset.sdk || 'openai';
+    document.getElementById('code-detail-params').value = row.dataset.params || '';
   }
 }
 
@@ -1309,7 +1318,8 @@ function showAddForm() {
       document.getElementById('code-detail-id').textContent = '新增';
       document.getElementById('code-detail-provider').value = '';
       document.getElementById('code-detail-model').value = '';
-      document.getElementById('code-detail-opt').value = '';
+      document.getElementById('code-detail-sdk').value = 'openai';
+      document.getElementById('code-detail-params').value = '';
       document.getElementById('code-detail').classList.add('active');
       break;
     case 'provider':
@@ -1414,7 +1424,8 @@ async function saveCodeDetail() {
   let id = document.getElementById('code-detail-id').textContent;
   const provider = document.getElementById('code-detail-provider').value;
   const model = document.getElementById('code-detail-model').value;
-  const opt = document.getElementById('code-detail-opt').value || '';
+  const sdk = document.getElementById('code-detail-sdk').value || 'openai';
+  const params = document.getElementById('code-detail-params').value || '';
 
   if (id === '新增') {
     id = prompt('请输入配置编号 (01-20):');
@@ -1429,7 +1440,7 @@ async function saveCodeDetail() {
     return;
   }
 
-  const url = `/api/add-code?num=${encodeURIComponent(id)}&provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}&opt=${encodeURIComponent(opt)}`;
+  const url = `/api/add-code?num=${encodeURIComponent(id)}&provider=${encodeURIComponent(provider)}&model=${encodeURIComponent(model)}&sdk=${encodeURIComponent(sdk)}&params=${encodeURIComponent(params)}`;
   if (await apiCall(url, 'Code 配置已保存', '保存失败')) {
     location.reload();
   }
