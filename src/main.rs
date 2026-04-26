@@ -1286,38 +1286,42 @@ impl LuaGateway {
                         .unwrap_or_else(|| "01".to_string())
             };
 
+            // 读取 code 配置: 格式 "provider|model|sdk|params"
             let code_key = format!("code:{}", selected);
-            let provider = redis::cmd("HGET")
+            let code_value: Option<String> = redis::cmd("GET")
                 .arg(&code_key)
-                .arg("provider")
-                .query::<Option<String>>(&mut conn)
+                .query(&mut conn)
                 .ok()
-                .flatten()
-                .unwrap_or_else(|| "anthropic".to_string());
-            let model = redis::cmd("HGET")
-                .arg(&code_key)
-                .arg("model")
-                .query::<Option<String>>(&mut conn)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| original_model.clone());
+                .flatten();
 
+            let (provider, target_model, sdk_type) = if let Some(ref val) = code_value {
+                let parts: Vec<&str> = val.split('|').collect();
+                let provider = parts.get(0).map(|s| s.to_string()).unwrap_or_else(|| "anthropic".to_string());
+                let model = parts.get(1).map(|s| s.to_string()).unwrap_or_else(|| original_model.clone());
+                let sdk = parts.get(2).map(|s| s.to_string()).unwrap_or_else(|| "openai".to_string());
+                (provider, model, sdk)
+            } else {
+                ("anthropic".to_string(), original_model.clone(), "openai".to_string())
+            };
+
+            // 读取 provider 配置: 格式 "baseurl|apikey"
             let provider_key = format!("provider:{}", provider);
-            let baseurl = redis::cmd("HGET")
+            let provider_value: Option<String> = redis::cmd("GET")
                 .arg(&provider_key)
-                .arg("baseurl")
-                .query::<Option<String>>(&mut conn)
+                .query(&mut conn)
                 .ok()
-                .flatten()
-                .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-            let apikey = redis::cmd("HGET")
-                .arg(&provider_key)
-                .arg("apikey")
-                .query::<Option<String>>(&mut conn)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+                .flatten();
 
+            let (baseurl, apikey) = if let Some(ref val) = provider_value {
+                let parts: Vec<&str> = val.split('|').collect();
+                let baseurl = parts.get(0).map(|s| s.to_string()).unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                let apikey = parts.get(1).map(|s| s.to_string()).unwrap_or_default();
+                (baseurl, apikey)
+            } else {
+                ("https://api.anthropic.com".to_string(), String::new())
+            };
+
+            // 提取 host (去掉协议前缀和路径部分)
             let host = baseurl
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
@@ -1326,20 +1330,43 @@ impl LuaGateway {
                 .unwrap_or(&baseurl)
                 .to_string();
 
-            ((host, baseurl, apikey), model, selected)
+            ((host, baseurl, apikey, sdk_type), target_model, selected)
         };
 
-        let (host, baseurl, apikey) = provider_config;
-        let upstream_url = format!("{}/v1/messages", baseurl.trim_end_matches('/'));
+        let (host, baseurl, apikey, sdk_type) = provider_config;
 
-        info!("[SDK:443/SSE] Routing to {} (model={}, upstream={})", selected_num, target_model, upstream_url);
+        // 根据 sdk 类型选择端点
+        // 注意：provider baseurl 不应包含 /v1 后缀，由代码统一添加
+        let endpoint = if sdk_type == "anthropic" {
+            "/v1/messages"
+        } else {
+            "/v1/chat/completions"
+        };
+        let upstream_url = format!("{}{}", baseurl.trim_end_matches('/'), endpoint);
 
-        // 构建请求体
-        let mut request_json: serde_json::Value = serde_json::from_slice(full_body)
-            .map_err(|e| Error::explain(ErrorType::InternalError, format!("invalid JSON: {}", e)))?;
-        request_json["model"] = serde_json::Value::String(target_model.clone());
-        let request_body = serde_json::to_string(&request_json)
-            .map_err(|e| Error::explain(ErrorType::InternalError, format!("JSON encode: {}", e)))?;
+        info!("[SDK:443/SSE] Routing to {} (model={}, sdk={}, upstream={})", selected_num, target_model, sdk_type, upstream_url);
+
+        // 根据 SDK 类型构建请求体
+        let request_body = if sdk_type == "openai" {
+            // Anthropic → OpenAI 格式转换
+            let original_body = std::str::from_utf8(full_body)
+                .map_err(|e| Error::explain(ErrorType::InternalError, format!("invalid UTF-8: {}", e)))?;
+            let transformed = transform_anthropic_request_to_openai(original_body, &target_model)
+                .unwrap_or_else(|| {
+                    // 降级：直接替换 model 字段
+                    let mut json: serde_json::Value = serde_json::from_slice(full_body).unwrap();
+                    json["model"] = serde_json::Value::String(target_model.clone());
+                    serde_json::to_string(&json).unwrap_or_default()
+                });
+            transformed
+        } else {
+            // Anthropic 直通：只替换 model 字段
+            let mut request_json: serde_json::Value = serde_json::from_slice(full_body)
+                .map_err(|e| Error::explain(ErrorType::InternalError, format!("invalid JSON: {}", e)))?;
+            request_json["model"] = serde_json::Value::String(target_model.clone());
+            serde_json::to_string(&request_json)
+                .map_err(|e| Error::explain(ErrorType::InternalError, format!("JSON encode: {}", e)))?
+        };
 
         // 创建 HTTP 客户端
         let client = reqwest::Client::builder()
@@ -1347,13 +1374,23 @@ impl LuaGateway {
             .build()
             .map_err(|e| Error::explain(ErrorType::InternalError, format!("create client: {}", e)))?;
 
-        let req = client
-            .post(&upstream_url)
-            .header("Content-Type", "application/json")
-            .header("Host", &host)
-            .header("x-api-key", &apikey)
-            .header("anthropic-version", "2023-06-01")
-            .body(request_body);
+        // 根据 SDK 类型设置请求头
+        let req = if sdk_type == "openai" {
+            client
+                .post(&upstream_url)
+                .header("Content-Type", "application/json")
+                .header("Host", &host)
+                .header("Authorization", format!("Bearer {}", apikey))
+                .body(request_body)
+        } else {
+            client
+                .post(&upstream_url)
+                .header("Content-Type", "application/json")
+                .header("Host", &host)
+                .header("x-api-key", &apikey)
+                .header("anthropic-version", "2023-06-01")
+                .body(request_body)
+        };
 
         // 注册 SSE 连接
         let conn_id = sse_register(String::new(), String::new(), target_model.clone());
@@ -1390,37 +1427,79 @@ impl LuaGateway {
         resp.insert_header("Connection", "keep-alive")?;
         session.write_response_header(Box::new(resp), false).await?;
 
-        let mut sse_parser = anthropic_client::AnthropicSseParser::new();
-        let mut stream_state = anthropic_client::StreamState::default();
+        // 根据 SDK 类型选择 SSE 解析方式
+        let mut input_tokens: u64 = 0;
+        let mut output_tokens: u64 = 0;
 
-        let mut stream_response = response;
-        while let Some(chunk) = stream_response.chunk().await.map_err(|e| {
-            sse_unregister(conn_id);
-            Error::explain(ErrorType::InternalError, format!("chunk read error: {}", e))
-        })? {
-            sse_parser.push_data(&chunk);
+        if sdk_type == "openai" {
+            // OpenAI SSE → Anthropic SSE 转换
+            let mut sse_parser = SseLineParser::new();
+            let mut state = new_sse_stream_state(target_model.clone());
 
-            let events = sse_parser.extract_events();
-            for event in events {
-                if let Some(output) = anthropic_client::process_sse_event(event, &mut stream_state) {
-                    if let Err(e) = session.write_response_body(Some(Bytes::from(output)), false).await {
-                        warn!("[SDK:443/SSE] Failed to write SSE event: {}", e);
+            let mut stream_response = response;
+            while let Some(chunk) = stream_response.chunk().await.map_err(|e| {
+                sse_unregister(conn_id);
+                Error::explain(ErrorType::InternalError, format!("chunk read error: {}", e))
+            })? {
+                sse_parser.push_data(&chunk);
+                let lines = sse_parser.extract_lines();
+
+                for line in lines {
+                    if line.is_empty() || line == "[DONE]" {
+                        continue;
+                    }
+
+                    let events = transform_openai_sse_chunk_to_anthropic(&line, &mut state);
+
+                    if !state.msg_id.is_empty() {
+                        sse_update_openai_id(conn_id, &state.msg_id);
+                    }
+
+                    for event in events {
+                        if let Err(e) = session.write_response_body(Some(Bytes::from(event)), false).await {
+                            warn!("[SDK:443/SSE/OpenAI] Failed to write event: {}", e);
+                        }
                     }
                 }
             }
-        }
 
-        // 确保流正常结束
-        if !stream_state.finished {
-            let end_event = format!("event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n");
-            let _ = session.write_response_body(Some(Bytes::from(end_event)), false).await;
+            input_tokens = state.input_tokens;
+            output_tokens = state.output_tokens;
+        } else {
+            // Anthropic 直通
+            let mut sse_parser = anthropic_client::AnthropicSseParser::new();
+            let mut stream_state = anthropic_client::StreamState::default();
+
+            let mut stream_response = response;
+            while let Some(chunk) = stream_response.chunk().await.map_err(|e| {
+                sse_unregister(conn_id);
+                Error::explain(ErrorType::InternalError, format!("chunk read error: {}", e))
+            })? {
+                sse_parser.push_data(&chunk);
+
+                let events = sse_parser.extract_events();
+                for event in events {
+                    if let Some(output) = anthropic_client::process_sse_event(event, &mut stream_state) {
+                        if let Err(e) = session.write_response_body(Some(Bytes::from(output)), false).await {
+                            warn!("[SDK:443/SSE/Anthropic] Failed to write event: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // 确保流正常结束
+            if !stream_state.finished {
+                let end_event = format!("event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n");
+                let _ = session.write_response_body(Some(Bytes::from(end_event)), false).await;
+            }
+
+            input_tokens = stream_state.usage.input_tokens;
+            output_tokens = stream_state.usage.output_tokens;
         }
 
         session.write_response_body(None, true).await?;
 
         // 更新统计
-        let input_tokens = stream_state.usage.input_tokens;
-        let output_tokens = stream_state.usage.output_tokens;
         if input_tokens > 0 || output_tokens > 0 {
             CODE_STATS_TOTAL_CALLS.fetch_add(1, Ordering::Relaxed);
             CODE_STATS_TOTAL_PROMPT.fetch_add(input_tokens, Ordering::Relaxed);
@@ -1436,8 +1515,8 @@ impl LuaGateway {
             info!("[SDK:443/SSE] Stats: num={}, prompt={}, completion={}", selected_num, input_tokens, output_tokens);
         }
 
-        info!("[SDK:443/SSE] Completed (msg_id={}, tokens: {}+{})",
-            stream_state.message_id, input_tokens, output_tokens);
+        info!("[SDK:443/SSE] Completed (sdk={}, tokens: {}+{})",
+            sdk_type, input_tokens, output_tokens);
 
         sse_unregister(conn_id);
         Ok(true)
@@ -1560,9 +1639,10 @@ impl ProxyHttp for LuaGateway {
         }
 
         // ================================================================
-        // SDK 模式：443 端口默认 Anthropic 协议，无需 URL 路径匹配
+        // SDK 模式：443/9443 端口默认 Anthropic 协议，无需 URL 路径匹配
+        // 注意：TLS 代理在 443 解密后转发到 9443，所以两个端口都要支持
         // ================================================================
-        if self.port == 443 {
+        if self.port == 443 || self.port == 9443 {
             return self.handle_sdk_mode(session, ctx, &method, &path).await;
         }
 

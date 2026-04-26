@@ -572,6 +572,11 @@ pub fn transform_anthropic_request_to_openai(body: &str, model: &str) -> Option<
 
     openai.insert("messages".into(), Value::Array(messages));
 
+    // 透传 stream 参数
+    if let Some(stream) = v.get("stream") {
+        openai.insert("stream".into(), stream.clone());
+    }
+
     // 透传通用参数
     for key in &[
         "max_tokens",

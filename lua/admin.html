@@ -801,6 +801,12 @@ tbody tr.selected {
           <span>统计</span>
         </div>
       </div>
+      <div class="nav-item" data-section="tls">
+        <div class="nav-item-left">
+          <span class="nav-icon">🔐</span>
+          <span>TLS</span>
+        </div>
+      </div>
     </nav>
 
     <div class="sidebar-footer">
@@ -1125,6 +1131,51 @@ tbody tr.selected {
         </div>
       </div>
 
+      <!-- TLS Section -->
+      <div class="section-content" id="section-tls">
+        <div class="list-panel">
+          <div class="list-header">
+            <span class="list-title">TLS/HTTPS 配置</span>
+          </div>
+          <div style="padding: 24px;">
+            <div class="detail-form">
+              <div class="form-group">
+                <label>启用 TLS</label>
+                <select id="tls-enabled">
+                  <option value="false">禁用</option>
+                  <option value="true">启用</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>TLS 监听地址</label>
+                <input type="text" id="tls-listen" value="0.0.0.0:443" placeholder="0.0.0.0:443">
+              </div>
+              <div class="form-group">
+                <label>Code HTTP 端口</label>
+                <input type="text" id="code-http" value="127.0.0.1:9443" placeholder="127.0.0.1:9443">
+              </div>
+              <div class="form-group full-width">
+                <label>证书路径 (cert)</label>
+                <input type="text" id="tls-cert" placeholder="D:/vscoding/llm-gateway/certs/server.crt">
+              </div>
+              <div class="form-group full-width">
+                <label>私钥路径 (key)</label>
+                <input type="text" id="tls-key" placeholder="D:/vscoding/llm-gateway/certs/server.key">
+              </div>
+            </div>
+            <div style="margin-top: 20px; display: flex; gap: 12px;">
+              <button class="btn btn-primary" onclick="saveTlsConfig()">保存 TLS 配置</button>
+              <button class="btn btn-ghost" onclick="loadTlsConfig()">重新加载</button>
+              <button class="btn btn-warning" onclick="reinitCode()">重新初始化 Code/ModelMap</button>
+            </div>
+            <div style="margin-top: 16px; padding: 12px; background: var(--bg-subtle); border-radius: var(--radius-sm); font-size: 0.85rem; color: var(--text-secondary);">
+              <strong>说明：</strong>启用 TLS 后，服务将在指定端口监听 HTTPS 请求。<br>
+              证书和私钥文件需要提前准备好。修改配置后需要重启服务生效。
+            </div>
+          </div>
+        </div>
+      </div>
+
     </div>
   </main>
 </div>
@@ -1145,7 +1196,7 @@ function toggleTheme() {
 })();
 
 // ===== Navigation =====
-const sections = ['llm', 'code', 'provider', 'opt', 'modelmap', 'stats'];
+const sections = ['llm', 'code', 'provider', 'opt', 'modelmap', 'stats', 'tls'];
 let currentSection = 'llm';
 
 // Data storage
@@ -1188,7 +1239,8 @@ function switchSection(section) {
     provider: 'Provider 配置',
     opt: 'Opt 配置',
     modelmap: 'ModelMap 配置',
-    stats: '统计信息'
+    stats: '统计信息',
+    tls: 'TLS/HTTPS 配置'
   };
   document.getElementById('section-title').textContent = titles[section];
 
@@ -1628,6 +1680,68 @@ function filterModelmap() {
     const name = row.querySelector('td')?.textContent.toLowerCase() || '';
     row.style.display = !search || name.includes(search) ? '' : 'none';
   });
+}
+
+// ===== TLS Config Functions =====
+async function loadTlsConfig() {
+  try {
+    const res = await fetch('/api/get-tls');
+    const config = await res.json();
+    document.getElementById('tls-enabled').value = config.enabled || 'false';
+    document.getElementById('tls-cert').value = config.cert || '';
+    document.getElementById('tls-key').value = config.key || '';
+    document.getElementById('tls-listen').value = config.listen || '0.0.0.0:443';
+    document.getElementById('code-http').value = config.code_http || '127.0.0.1:9443';
+  } catch (e) {
+    showToast('加载 TLS 配置失败: ' + e.message, 'error');
+  }
+}
+
+async function saveTlsConfig() {
+  const config = {
+    enabled: document.getElementById('tls-enabled').value,
+    cert: document.getElementById('tls-cert').value,
+    key: document.getElementById('tls-key').value,
+    listen: document.getElementById('tls-listen').value,
+    code_tls: document.getElementById('tls-listen').value,
+    code_http: document.getElementById('code-http').value
+  };
+
+  const params = new URLSearchParams(config);
+  const url = `/api/set-tls?${params.toString()}`;
+
+  if (await apiCall(url, 'TLS 配置已保存，重启服务后生效', '保存失败')) {
+    // Reload to confirm
+    loadTlsConfig();
+  }
+}
+
+// Load TLS config when switching to TLS section
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    if (item.dataset.section === 'tls') {
+      loadTlsConfig();
+    }
+  });
+});
+
+// ===== Reinitialize Code/ModelMap =====
+async function reinitCode() {
+  if (!confirm('确定重新初始化 Code 和 ModelMap 配置？\n\n这将清除当前 Redis 中的配置，从 config.lua 重新加载。')) {
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/reinit-code');
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`重新初始化完成: ${data.code} 个 Code 配置, ${data.modelmap} 个 ModelMap`, 'success');
+    } else {
+      showToast('初始化失败: ' + (data.error || '未知错误'), 'error');
+    }
+  } catch (e) {
+    showToast('初始化失败: ' + e.message, 'error');
+  }
 }
 </script>
 

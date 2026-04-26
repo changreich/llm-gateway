@@ -560,10 +560,18 @@ fn extract_openai_chunk_info(chunk: &Value) -> Option<OpenaiChunkInfo> {
 
     let delta = choice.get("delta")?;
 
+    // 提取 content，如果为空则尝试 reasoning（OpenRouter 格式）
     let delta_content = delta
         .get("content")
         .and_then(|c| c.as_str())
-        .map(|s| s.to_string());
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            delta
+                .get("reasoning")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+        });
 
     let delta_role = delta
         .get("role")

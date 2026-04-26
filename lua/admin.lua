@@ -196,6 +196,14 @@ local function generate_config_lua()
     local code_select = safe_redis_get("code:select") or "01"
     local global_proxy = safe_redis_get("global:proxy") or ""
 
+    -- TLS 配置
+    local tls_enabled = safe_redis_get("tls:enabled") == "true"
+    local tls_cert = safe_redis_get("tls:cert") or ""
+    local tls_key = safe_redis_get("tls:key") or ""
+    local tls_listen = safe_redis_get("tls:listen") or "0.0.0.0:443"
+    local code_tls = safe_redis_get("code:tls") or "0.0.0.0:443"
+    local code_http = safe_redis_get("code:http") or "127.0.0.1:9443"
+
     table.insert(lines, string.format('    cool_down = %d,', cool_down))
     table.insert(lines, string.format('    llm_selected = "%s",', llm_select))
     table.insert(lines, string.format('    code_selected = "%s",', code_select))
@@ -304,6 +312,26 @@ local function generate_config_lua()
         table.insert(lines, "    },")
         table.insert(lines, "")
     end
+
+    -- TLS 配置
+    if tls_enabled or tls_cert ~= "" then
+        table.insert(lines, "    tls = {")
+        table.insert(lines, string.format('        enabled = %s,', tls_enabled and "true" or "false"))
+        if tls_cert ~= "" then
+            table.insert(lines, string.format('        cert = "%s",', tls_cert))
+        end
+        if tls_key ~= "" then
+            table.insert(lines, string.format('        key = "%s",', tls_key))
+        end
+        table.insert(lines, string.format('        listen = "%s"', tls_listen))
+        table.insert(lines, "    },")
+        table.insert(lines, "")
+    end
+
+    -- Code 端口配置
+    table.insert(lines, string.format('    code_tls = "%s",', code_tls))
+    table.insert(lines, string.format('    code_http = "%s",', code_http))
+    table.insert(lines, "")
 
     -- embed/rank 保持默认
     table.insert(lines, '    embed = {provider = "Local1", model = "bge-large-zh-v1.5-q8_0"},')
@@ -479,8 +507,8 @@ function handler.on_request(method, path, headers, body)
         return { action = "reject", status = 200, body = result }
     end
 
-    -- API: 设置配置
-    if path:match("^/api/set") then
+    -- API: 设置配置 (通用 key=value 接口)
+    if path:match("^/api/set%?") then
         local key = url_decode(path:match("key=([^&]+)") or "")
         local value = url_decode(path:match("value=([^&]+)") or "")
         if key and key ~= "" then
@@ -705,6 +733,42 @@ function handler.on_request(method, path, headers, body)
         return { action = "reject", status = 400, body = '{"ok":false,"error":"missing name"}' }
     end
 
+    -- API: 获取 TLS 配置
+    if path:match("^/api/get%-tls") then
+        local enabled = safe_redis_get("tls:enabled") or "false"
+        local cert = safe_redis_get("tls:cert") or ""
+        local key = safe_redis_get("tls:key") or ""
+        local listen = safe_redis_get("tls:listen") or "0.0.0.0:443"
+        local code_tls = safe_redis_get("code:tls") or "0.0.0.0:443"
+        local code_http = safe_redis_get("code:http") or "127.0.0.1:9443"
+        -- 转义 JSON 字符串中的特殊字符
+        local function json_escape(s)
+            return s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+        end
+        local json = string.format('{"enabled":"%s","cert":"%s","key":"%s","listen":"%s","code_tls":"%s","code_http":"%s"}',
+            enabled, json_escape(cert), json_escape(key), listen, code_tls, code_http)
+        return { action = "reject", status = 200, body = json }
+    end
+
+    -- API: 设置 TLS 配置
+    if path:match("^/api/set%-tls") then
+        local enabled = url_decode(path:match("enabled=([^&]+)") or "false")
+        local cert = url_decode(path:match("cert=([^&]+)") or "")
+        local key = url_decode(path:match("key=([^&]+)") or "")
+        local listen = url_decode(path:match("listen=([^&]+)") or "0.0.0.0:443")
+        local code_tls = url_decode(path:match("code_tls=([^&]+)") or "0.0.0.0:443")
+        local code_http = url_decode(path:match("code_http=([^&]+)") or "127.0.0.1:9443")
+
+        pcall(redis_set, "tls:enabled", enabled)
+        pcall(redis_set, "tls:cert", cert)
+        pcall(redis_set, "tls:key", key)
+        pcall(redis_set, "tls:listen", listen)
+        pcall(redis_set, "code:tls", code_tls)
+        pcall(redis_set, "code:http", code_http)
+
+        return { action = "reject", status = 200, body = '{"ok":true}' }
+    end
+
     -- API: 重置统计
     if path:match("^/api/reset%-stats") then
         local keys1 = safe_redis_keys("llm:count:*")
@@ -739,6 +803,61 @@ function handler.on_request(method, path, headers, body)
         file:close()
 
         return { action = "reject", status = 200, body = '{"ok":true,"file":"config.lua"}' }
+    end
+
+    -- API: 强制重新初始化 code/modelmap 配置
+    if path:match("^/api/reinit%-code") then
+        -- 清除初始化标记
+        pcall(redis_del, "code:initialized")
+
+        -- 重新加载 config.lua
+        local config_file = loadfile(script_dir .. "/config.lua")
+        local config = config_file and config_file() or {}
+
+        local code_cfg = config.code or {}
+        local modelmap_cfg = config.modelmap or {}
+
+        -- 设置默认选中
+        if config.code_selected then
+            pcall(redis_set, "code:select", config.code_selected)
+        end
+
+        -- 写入 code 配置
+        local code_count = 0
+        for num, cfg in pairs(code_cfg) do
+            local key = "code:" .. num
+            local sdk = cfg.sdk or cfg.opt or "openai"
+            local params = cfg.params or ""
+            local value = (cfg.provider or "") .. "|" .. (cfg.model or "") .. "|" .. sdk .. "|" .. params
+            pcall(redis_set, key, value)
+            if cfg.proxy then
+                pcall(redis_set, "code:" .. num .. ":proxy", cfg.proxy)
+            else
+                pcall(redis_del, "code:" .. num .. ":proxy")
+            end
+            code_count = code_count + 1
+        end
+
+        -- 清除旧的 modelmap
+        local ok, old_keys = pcall(redis_keys, "modelmap:*")
+        if ok and old_keys then
+            for _, key in ipairs(old_keys) do
+                pcall(redis_del, key)
+            end
+        end
+
+        -- 写入 modelmap 配置
+        local modelmap_count = 0
+        for model_name, num in pairs(modelmap_cfg) do
+            local key = "modelmap:" .. model_name
+            pcall(redis_set, key, num)
+            modelmap_count = modelmap_count + 1
+        end
+
+        -- 标记已初始化
+        pcall(redis_set, "code:initialized", "1")
+
+        return { action = "reject", status = 200, body = '{"ok":true,"code":' .. code_count .. ',"modelmap":' .. modelmap_count .. '}' }
     end
 
     -- API: 预览配置文件内容

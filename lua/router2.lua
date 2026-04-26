@@ -63,29 +63,16 @@ local function init_config_to_redis()
     end
 
     -- ============================================================
-    -- 以下配置只在首次初始化时写入
+    -- code 和 modelmap 配置只在首次初始化时写入 (与 llm 逻辑一致)
     -- ============================================================
     local ok, initialized = pcall(redis_get, "code:initialized")
-
-    -- 如果 initialized 存在且为 "1"，检查 code:select 是否存在
     if ok and initialized == "1" then
-        local select_exists = pcall(redis_get, "code:select")
-        if not select_exists or select_exists == "" then
-            -- code:select 不存在，强制重新初始化
-            pcall(redis_set, "code:initialized", "")
-        else
-            return
-        end
+        return  -- 已初始化，跳过
     end
 
-    -- 先设置默认选中，确保 code:select 最早被创建
+    -- 设置默认选中
     if default_config.code_selected then
         pcall(redis_set, "code:select", default_config.code_selected)
-    end
-
-    -- 写入全局代理配置
-    if default_config.proxy then
-        pcall(redis_set, "global:proxy", default_config.proxy)
     end
 
     -- 写入 code 配置 (含 sdk)
@@ -102,6 +89,8 @@ local function init_config_to_redis()
         -- 写入 code 级代理配置
         if cfg.proxy then
             pcall(redis_set, "code:" .. num .. ":proxy", cfg.proxy)
+        else
+            pcall(redis_del, "code:" .. num .. ":proxy")
         end
     end
 
