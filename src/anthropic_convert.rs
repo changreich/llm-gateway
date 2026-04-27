@@ -404,11 +404,13 @@ fn tool_result_content_to_string(v: &Value) -> String {
 }
 
 /// Anthropic content blocks -> OpenAI content/tool_calls/tool messages
-fn anthropic_content_to_openai(role: &str, blocks: &[Value]) -> (Value, Vec<Value>, Vec<Value>) {
+/// Returns (content, tool_calls, tool_messages, reasoning_content)
+fn anthropic_content_to_openai(role: &str, blocks: &[Value]) -> (Value, Vec<Value>, Vec<Value>, Option<String>) {
     let mut text_parts: Vec<String> = Vec::new();
     let mut multipart_parts: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_messages: Vec<Value> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
     let mut has_non_text_part = false;
 
     for b in blocks {
@@ -418,6 +420,12 @@ fn anthropic_content_to_openai(role: &str, blocks: &[Value]) -> (Value, Vec<Valu
                 let t = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 text_parts.push(t.to_string());
                 multipart_parts.push(json!({"type": "text", "text": t}));
+            }
+            "thinking" => {
+                let t = b.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                if !t.is_empty() {
+                    reasoning_parts.push(t.to_string());
+                }
             }
             "image" if role == "user" => {
                 if let Some(source) = b.get("source") {
@@ -478,13 +486,19 @@ fn anthropic_content_to_openai(role: &str, blocks: &[Value]) -> (Value, Vec<Valu
         }
     }
 
+    let reasoning_content = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join("\n"))
+    };
+
     let content = if has_non_text_part {
         Value::Array(multipart_parts)
     } else {
         Value::String(text_parts.join("\n"))
     };
 
-    (content, tool_calls, tool_messages)
+    (content, tool_calls, tool_messages, reasoning_content)
 }
 
 /// 将 Anthropic 格式请求体转为 OpenAI 格式
@@ -528,7 +542,7 @@ pub fn transform_anthropic_request_to_openai(body: &str, model: &str) -> Option<
             let openai_content = match content {
                 Some(Value::String(s)) => Value::String(s.clone()),
                 Some(Value::Array(arr)) => {
-                    let (content_val, tool_calls, tool_messages) =
+                    let (content_val, tool_calls, tool_messages, reasoning_content) =
                         anthropic_content_to_openai(role, arr);
                     for m in tool_messages {
                         messages.push(m);
@@ -552,8 +566,21 @@ pub fn transform_anthropic_request_to_openai(body: &str, model: &str) -> Option<
                             {
                                 obj.remove("content");
                             }
+                            if let Some(ref rc) = reasoning_content {
+                                obj.insert("reasoning_content".to_string(), Value::String(rc.clone()));
+                            }
                         }
                         messages.push(assistant_msg);
+                        continue;
+                    }
+                    if role == "assistant" && reasoning_content.is_some() {
+                        let mut msg = json!({"role": "assistant", "content": content_val});
+                        if let Some(obj) = msg.as_object_mut() {
+                            if let Some(ref rc) = reasoning_content {
+                                obj.insert("reasoning_content".to_string(), Value::String(rc.clone()));
+                            }
+                        }
+                        messages.push(msg);
                         continue;
                     }
                     content_val
